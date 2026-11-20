@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      16.0.0
-// @description  Kiến trúc bảo vệ tối đa: chống tráo link pha bubble, vá lỗ hổng no-referrer, khóa outerHTML/document.write và tối ưu SPA trên Orion iOS
+// @version      17.0.0
+// @description  Kiến trúc bảo vệ tối đa: chống redirect trễ 4G/5G, khóa HTMLElement.prototype.click, ngụy trang native code và tối ưu player trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -171,7 +171,7 @@
     }
   }
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (kể cả khi trang ẩn referrer)
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (hỗ trợ cả chuỗi redirect trễ 4G/5G + no-referrer)
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -191,7 +191,7 @@
       const lastTouch = getVal("gx_last_touch", null);
       const spawnedRightAfterTouch =
         Boolean(lastTouch) &&
-        Date.now() - lastTouch.time < 1500 &&
+        Date.now() - lastTouch.time < 4500 &&
         Boolean(lastTouch.root) &&
         lastTouch.root !== curRoot &&
         !isWhitelistedHost(lastTouch.host, lastTouch.root);
@@ -554,7 +554,7 @@
       try {
         const p = new URL(u, window.location.href);
         if (!isSameSite(u)) return false;
-        if (/^\/(go|out|away|redir|redirect|exit|jump|aff|visit|external|click|track)(\/|\.|$)/i.test(p.pathname)) {
+        if (/^\/(go|out|away|redir|redirect|exit|jump|aff)(\/|\.|$)/i.test(p.pathname)) {
           return true;
         }
         for (const [k, rawVal] of p.searchParams.entries()) {
@@ -781,10 +781,20 @@
       const s = window.getComputedStyle(target);
       if (s.position !== "fixed" && s.position !== "absolute") return false;
 
+      const insidePlayer = Boolean(target.closest('[class*="player" i], [id*="player" i]'));
       const isLargeOverlay =
         (r.width >= window.innerWidth * 0.65 && r.height >= window.innerHeight * 0.5) ||
-        Boolean(target.closest('[class*="player" i], [id*="player" i]'));
+        insidePlayer;
       if (!isLargeOverlay) return false;
+
+      // Giữ nguyên lớp nhận thao tác Play/Pause của các trình phát video hợp lệ trừ khi bị đặt z-index quảng cáo cực cao
+      if (insidePlayer) {
+        const z = parseInt(s.zIndex, 10) || 0;
+        const hasAdLink = target.tagName === "A" || Boolean(target.querySelector("a[href]"));
+        if (!hasAdLink && z < 9999 && parseFloat(s.opacity) >= 0.08) {
+          return false;
+        }
+      }
 
       const opacity = parseFloat(s.opacity);
       if (opacity < 0.08) {
@@ -1312,7 +1322,6 @@
       reportLegitExternalNav(href, gateway);
     }
 
-    // Chốt hậu kiểm pha bubble: ngăn quảng cáo tráo đổi anchor.href hoặc target sau khi pha capture đã duyệt
     function verifyPostBubbleClick(e) {
       if (bypassed || e.defaultPrevented) return;
       const { anchor } = findControls(e);
@@ -1391,6 +1400,30 @@
       return origFn.apply(form, args);
     };
 
+    const nativeFnLabels = new WeakMap();
+    const maskAsNative = (fn, name) => {
+      try {
+        nativeFnLabels.set(fn, `function ${name}() { [native code] }`);
+      } catch {}
+      return fn;
+    };
+
+    try {
+      const origFnToString = Function.prototype.toString;
+      const maskedToString = function () {
+        if (nativeFnLabels.has(this)) {
+          return nativeFnLabels.get(this);
+        }
+        return origFnToString.apply(this, arguments);
+      };
+      maskAsNative(maskedToString, "toString");
+      Object.defineProperty(Function.prototype, "toString", {
+        configurable: true,
+        writable: true,
+        value: maskedToString
+      });
+    } catch {}
+
     function patchWindowEnvironment(w) {
       if (!w || w.__gxEnvLocked) return;
       try {
@@ -1401,7 +1434,7 @@
 
       try {
         const origOpen = w.open;
-        const lockedOpen = function (url, target, features) {
+        const lockedOpen = maskAsNative(function (url, target, features) {
           const cleanTarget = String(target || "").trim();
           const isNew =
             (!cleanTarget || (cleanTarget !== "_self" && cleanTarget !== "_parent" && cleanTarget !== "_top")) &&
@@ -1419,7 +1452,7 @@
             url,
             canPromote ? { origOpen, ownerWin: this || w, target, features } : null
           );
-        };
+        }, "open");
         try {
           Object.defineProperty(w, "open", { configurable: false, writable: false, value: lockedOpen });
         } catch {
@@ -1436,13 +1469,13 @@
         const locProto = w.Location && w.Location.prototype;
         if (locProto) {
           const origAssign = locProto.assign;
-          const lockedAssign = function (url) {
+          const lockedAssign = maskAsNative(function (url) {
             if (!bypassed && !isAllowed(String(url), false)) {
               reportBlock();
               return;
             }
             return origAssign.apply(this, arguments);
-          };
+          }, "assign");
           try {
             Object.defineProperty(locProto, "assign", { configurable: false, writable: false, value: lockedAssign });
           } catch {
@@ -1450,13 +1483,13 @@
           }
 
           const origReplace = locProto.replace;
-          const lockedReplace = function (url) {
+          const lockedReplace = maskAsNative(function (url) {
             if (!bypassed && !isAllowed(String(url), false)) {
               reportBlock();
               return;
             }
             return origReplace.apply(this, arguments);
-          };
+          }, "replace");
           try {
             Object.defineProperty(locProto, "replace", { configurable: false, writable: false, value: lockedReplace });
           } catch {
@@ -1469,7 +1502,7 @@
         const docProto = w.Document && w.Document.prototype;
         if (docProto && docProto.open && !docProto.__gxDocOpenLocked) {
           const origDocOpen = docProto.open;
-          docProto.open = function () {
+          docProto.open = maskAsNative(function () {
             const res = origDocOpen.apply(this, arguments);
             try {
               if (this && this.defaultView) {
@@ -1477,31 +1510,64 @@
               }
             } catch {}
             return res;
-          };
+          }, "open");
           Object.defineProperty(docProto, "__gxDocOpenLocked", { value: true });
         }
       } catch {}
 
+      // Khóa đồng bộ click giả lập trên cả <a>, <area> và HTMLElement.prototype.click.call(el)
       try {
-        const aProto = w.HTMLAnchorElement && w.HTMLAnchorElement.prototype;
-        if (aProto && aProto.click) {
-          const origAClick = aProto.click;
-          Object.defineProperty(aProto, "click", {
-            configurable: true,
-            writable: true,
-            value: function () {
-              const hrefStr = typeof this.href === "string" ? this.href : "";
+        const guardElementClick = (el, origClickFn, args) => {
+          if (!bypassed && el && el.nodeType === 1) {
+            if (el.localName === "a" || el.localName === "area") {
+              const hrefStr = typeof el.href === "string" ? el.href : getAnchorHref(el);
               const isBlobOrData = hrefStr.startsWith("blob:") || hrefStr.startsWith("data:");
               const dl =
-                this.hasAttribute("download") &&
+                el.hasAttribute("download") &&
                 (isBlobOrData || (allowMode !== "NONE" && Date.now() <= allowedUntil));
-              if (!bypassed && !dl && !isAllowed(hrefStr, opensNew(this))) {
+              if (!dl && !isAllowed(hrefStr, opensNew(el))) {
                 lastAttempt = Date.now();
                 reportBlock();
                 return;
               }
-              return origAClick.apply(this, arguments);
             }
+          }
+          return origClickFn.apply(el, args);
+        };
+
+        const htmlElProto = w.HTMLElement && w.HTMLElement.prototype;
+        if (htmlElProto && htmlElProto.click) {
+          const origHtmlClick = htmlElProto.click;
+          Object.defineProperty(htmlElProto, "click", {
+            configurable: true,
+            writable: true,
+            value: maskAsNative(function () {
+              return guardElementClick(this, origHtmlClick, arguments);
+            }, "click")
+          });
+        }
+
+        const aProto = w.HTMLAnchorElement && w.HTMLAnchorElement.prototype;
+        if (aProto && aProto.click && (!htmlElProto || aProto.click !== htmlElProto.click)) {
+          const origAClick = aProto.click;
+          Object.defineProperty(aProto, "click", {
+            configurable: true,
+            writable: true,
+            value: maskAsNative(function () {
+              return guardElementClick(this, origAClick, arguments);
+            }, "click")
+          });
+        }
+
+        const areaProto = w.HTMLAreaElement && w.HTMLAreaElement.prototype;
+        if (areaProto && areaProto.click && (!htmlElProto || areaProto.click !== htmlElProto.click)) {
+          const origAreaClick = areaProto.click;
+          Object.defineProperty(areaProto, "click", {
+            configurable: true,
+            writable: true,
+            value: maskAsNative(function () {
+              return guardElementClick(this, origAreaClick, arguments);
+            }, "click")
           });
         }
       } catch {}
@@ -1513,18 +1579,18 @@
           Object.defineProperty(fProto, "submit", {
             configurable: true,
             writable: true,
-            value: function () {
+            value: maskAsNative(function () {
               return guardFormCall(this, origFSubmit, arguments);
-            }
+            }, "submit")
           });
           if (typeof fProto.requestSubmit === "function") {
             const origFReqSubmit = fProto.requestSubmit;
             Object.defineProperty(fProto, "requestSubmit", {
               configurable: true,
               writable: true,
-              value: function () {
+              value: maskAsNative(function () {
                 return guardFormCall(this, origFReqSubmit, arguments);
-              }
+              }, "requestSubmit")
             });
           }
         }
@@ -1725,7 +1791,7 @@
       let historySpamCount = 0;
       let historySpamWindowStart = 0;
       const origPushState = History.prototype.pushState;
-      History.prototype.pushState = function (state, title, url) {
+      History.prototype.pushState = maskAsNative(function (state, title, url) {
         if (!bypassed) {
           const noUserGesture = Date.now() - lastGestureTime > 1500;
           if (noUserGesture) {
@@ -1752,7 +1818,7 @@
           }
         }
         return origPushState.apply(this, arguments);
-      };
+      }, "pushState");
     } catch {}
 
     const sanitizeWrittenHtml = (args) => {
@@ -1762,7 +1828,7 @@
         if (typeof out[i] === "string") {
           out[i] = out[i]
             .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, "")
-            .replace(/<base\b[^>]*target\s*=\s*["']?_blank["']?[^>]*>/gi, "");
+            .replace(/<base\b([^>]*?)\btarget\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)([^>]*)>/gi, "<base$1$2>");
         }
       }
       return out;
@@ -1770,19 +1836,19 @@
 
     try {
       const origWrite = Document.prototype.write;
-      Document.prototype.write = function () {
+      Document.prototype.write = maskAsNative(function () {
         if (!bypassed && this === document && this.readyState === "complete") return;
         return origWrite.apply(this, sanitizeWrittenHtml(arguments));
-      };
+      }, "write");
     } catch {}
 
     try {
       const origWriteln = Document.prototype.writeln;
       if (typeof origWriteln === "function") {
-        Document.prototype.writeln = function () {
+        Document.prototype.writeln = maskAsNative(function () {
           if (!bypassed && this === document && this.readyState === "complete") return;
           return origWriteln.apply(this, sanitizeWrittenHtml(arguments));
-        };
+        }, "writeln");
       }
     } catch {}
 
