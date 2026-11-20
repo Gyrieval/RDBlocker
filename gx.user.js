@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      13.0.0
-// @description  Kiến trúc bảo vệ toàn diện: khóa data/blob popunder, chống tráo href tại touchend, khóa srcdoc/ShadowDOM và chặn ép mở App Store trên Orion iOS
+// @version      14.0.0
+// @description  Kiến trúc bảo vệ tối đa: chống tráo pseudo-link, khóa Document.prototype.open, giải mã cổng redirect đa lớp và chặn history flood trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -98,8 +98,17 @@
     setVal("gx_blocked_count", blockedCount);
   };
 
+  function silencePageMedia() {
+    try {
+      document.querySelectorAll("video, audio").forEach((m) => {
+        try { m.pause(); m.muted = true; } catch {}
+      });
+    } catch {}
+  }
+
   function showLoopGuardBanner(targetDomain, prevUrl, isIsolatedTab) {
     const render = () => {
+      silencePageMedia();
       if (!document.body || document.getElementById("__gx_loop_bar")) return;
       const bar = document.createElement("div");
       bar.id = "__gx_loop_bar";
@@ -188,6 +197,7 @@
       if ((fromExternalSite || spawnedByOpener || spawnedRightAfterTouch) && !isUserIntendedNav) {
         addBlock();
         try { window.stop(); } catch {}
+        silencePageMedia();
 
         if (window.history.length <= 2 || spawnedByOpener) {
           try { window.close(); } catch {}
@@ -437,17 +447,44 @@
       }
     };
 
+    // Giải mã đa lớp tham số (URL-encoded kép, protocol-relative, Base64) để phát hiện cổng chuyển tiếp nội bộ
+    const decodeParamCandidate = (val) => {
+      let cur = String(val || "").trim();
+      for (let i = 0; i < 2; i++) {
+        if (/%[0-9a-f]{2}/i.test(cur)) {
+          try {
+            const dec = decodeURIComponent(cur);
+            if (dec === cur) break;
+            cur = dec.trim();
+          } catch {
+            break;
+          }
+        }
+      }
+      if (/^aHR0c(Dov|HM6)/i.test(cur)) {
+        try {
+          const decodedB64 = atob(cur.replace(/-/g, "+").replace(/_/g, "/")).trim();
+          if (/^https?:\/\//i.test(decodedB64)) return decodedB64;
+        } catch {}
+      }
+      if (cur.startsWith("//") && cur.length > 4) {
+        return window.location.protocol + cur;
+      }
+      return cur;
+    };
+
     const isRedirectGateway = (u) => {
       try {
         const p = new URL(u, window.location.href);
         if (!isSameSite(u)) return false;
-        if (/^\/(go|out|away|redir|redirect|exit|jump|aff)\b/i.test(p.pathname)) {
+        if (/^\/(go|out|away|redir|redirect|exit|jump|aff|visit|external|click|track)(\/|\.|$)/i.test(p.pathname)) {
           return true;
         }
-        for (const [k, v] of p.searchParams.entries()) {
-          if (/^(url|to|dest|destination|target|redirect|redir|link|u|r|goto)$/i.test(k)) {
-            if (/^https?:\/\//i.test(v)) {
-              const destUrl = new URL(v);
+        for (const [k, rawVal] of p.searchParams.entries()) {
+          if (/^(url|to|dest|destination|target|redirect|redir|link|u|r|goto|away|out)$/i.test(k)) {
+            const candidate = decodeParamCandidate(rawVal);
+            if (/^https?:\/\//i.test(candidate)) {
+              const destUrl = new URL(candidate);
               if (!isSameSite(destUrl.href) && !isWhitelistedUrl(destUrl.href)) {
                 return true;
               }
@@ -467,6 +504,7 @@
     let lockedHref = null;
     let touchOriginTarget = null;
     let touchOriginAnchor = null;
+    let touchOriginWasPseudo = false;
     let touchOriginTime = 0;
     let touchMoved = false;
     let trustedGestureDepth = 0;
@@ -488,11 +526,19 @@
     const hasActiveUserGesture = () =>
       trustedGestureDepth > 0 || Date.now() - lastVerifiedTapTime < 250;
 
+    // Phát hiện cả thẻ <a> ngoại lai tiêm mới lẫn pseudo-link (href="#") bị tráo thành link quảng cáo trong lúc chạm
     const isInjectedExternalAnchor = (anchor, sameClean) => {
       if (sameClean || !anchor) return false;
       if (Date.now() - touchOriginTime >= 1500) return false;
-      if (touchOriginAnchor === anchor) return false;
-      if (!touchOriginAnchor) return true;
+      if (touchOriginAnchor === anchor) {
+        return touchOriginWasPseudo;
+      }
+      if (touchOriginAnchor && touchOriginAnchor !== anchor) {
+        return true;
+      }
+      if (!touchOriginAnchor) {
+        return true;
+      }
       if (touchOriginTarget && anchor.contains(touchOriginTarget)) return false;
       return true;
     };
@@ -595,8 +641,12 @@
         return false;
       }
       const s = window.getComputedStyle(a);
+      const hasVisibleText =
+        a.innerText.trim().length > 0 &&
+        parseFloat(s.fontSize) >= 8 &&
+        !isTransparentColor(s.color);
       const hasBgImage = s.backgroundImage && s.backgroundImage !== "none" && r.width >= 16 && r.height >= 16;
-      return a.innerText.trim().length > 0 || hasVisibleGraphicChild(a) || hasBgImage;
+      return hasVisibleText || hasVisibleGraphicChild(a) || hasBgImage;
     };
 
     function hasFullPseudoOverlay(el) {
@@ -742,7 +792,6 @@
     function authorize(e, wantsNewTab = false, dur = 3000) {
       const { anchor, button, nativeBtn } = findControls(e);
       if (anchor && !isPseudo(anchor)) {
-        // Luôn ưu tiên href đã khóa tại touchstart, chống tráo link giữa lúc chạm
         let href = getAnchorHref(anchor);
         if (lockedA === anchor && lockedHref && href !== lockedHref) {
           try { anchor.setAttribute("href", lockedHref); } catch {}
@@ -805,12 +854,10 @@
       const trimmed = String(url).trim();
       const lower = trimmed.toLowerCase();
 
-      // Chặn tuyệt đối javascript: và data: (ngăn pop-up data:text/html tự chuyển hướng)
       if (lower.startsWith("javascript:") || lower.startsWith("data:")) return false;
 
       const expired = Date.now() > allowedUntil || allowMode === "NONE";
 
-      // blob: chỉ được phép trong tab hiện tại (xem media/tải tệp), không được mở tab quảng cáo mới
       if (lower.startsWith("blob:")) {
         return !isNewTab && !expired && (hasActiveUserGesture() || allowMode === "BUTTON" || allowMode === "DOMAIN");
       }
@@ -981,6 +1028,20 @@
       }
     });
 
+    const captureTouchOrigin = (e) => {
+      const { anchor } = findControls(e);
+      touchOriginTarget = e.target;
+      touchOriginAnchor = anchor;
+      touchOriginWasPseudo = anchor ? isPseudo(anchor) : false;
+      touchOriginTime = Date.now();
+      if (anchor && !touchOriginWasPseudo) {
+        lockedA = anchor;
+        lockedHref = getAnchorHref(anchor);
+      } else {
+        resetAuth();
+      }
+    };
+
     window.addEventListener(
       "touchstart",
       (e) => {
@@ -996,16 +1057,7 @@
           resetAuth();
           return;
         }
-        const { anchor } = findControls(e);
-        touchOriginTarget = e.target;
-        touchOriginAnchor = anchor;
-        touchOriginTime = Date.now();
-        if (anchor && !isPseudo(anchor)) {
-          lockedA = anchor;
-          lockedHref = getAnchorHref(anchor);
-        } else {
-          resetAuth();
-        }
+        captureTouchOrigin(e);
       },
       true
     );
@@ -1062,14 +1114,7 @@
       (e) => {
         if (!e.isTrusted || bypassed || e.pointerType === "touch") return;
         const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
-        const { anchor } = findControls(e);
-        touchOriginTarget = e.target;
-        touchOriginAnchor = anchor;
-        touchOriginTime = Date.now();
-        if (anchor && !isPseudo(anchor)) {
-          lockedA = anchor;
-          lockedHref = getAnchorHref(anchor);
-        }
+        captureTouchOrigin(e);
         runVerifiedPress(e, wantsNewTab);
       },
       true
@@ -1292,6 +1337,24 @@
         }
       } catch {}
 
+      // Tái khóa Window ngay khi iframe gọi contentDocument.open() làm mới ngữ cảnh toàn cục
+      try {
+        const docProto = w.Document && w.Document.prototype;
+        if (docProto && docProto.open && !docProto.__gxDocOpenLocked) {
+          const origDocOpen = docProto.open;
+          docProto.open = function () {
+            const res = origDocOpen.apply(this, arguments);
+            try {
+              if (this && this.defaultView) {
+                patchWindowEnvironment(this.defaultView);
+              }
+            } catch {}
+            return res;
+          };
+          Object.defineProperty(docProto, "__gxDocOpenLocked", { value: true });
+        }
+      } catch {}
+
       try {
         const aProto = w.HTMLAnchorElement && w.HTMLAnchorElement.prototype;
         if (aProto && aProto.click) {
@@ -1399,7 +1462,6 @@
       }
     }
 
-    // Chặn mã quảng cáo chạy sớm bên trong iframe srcdoc trước khi sự kiện load kích hoạt
     try {
       const sdDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "srcdoc");
       if (sdDesc && sdDesc.set) {
@@ -1514,26 +1576,34 @@
       }
     } catch {}
 
+    // Chặn bẫy nhồi lịch sử trình duyệt (kể cả khi thay đổi tham số truy vấn ?_r=1, ?_r=2)
     try {
       let historySpamCount = 0;
       let historySpamWindowStart = 0;
       const origPushState = History.prototype.pushState;
       History.prototype.pushState = function (state, title, url) {
         if (!bypassed) {
-          const targetHref = url ? normUrl(String(url)) : normUrl(window.location.href);
-          const isSamePageTrap = targetHref === normUrl(window.location.href);
           const noUserGesture = Date.now() - lastGestureTime > 1500;
-          if (isSamePageTrap && noUserGesture) {
-            const now = Date.now();
-            if (now - historySpamWindowStart > 2000) {
-              historySpamWindowStart = now;
-              historySpamCount = 1;
-            } else {
-              historySpamCount += 1;
+          if (noUserGesture) {
+            let sameOrigin = true;
+            if (url) {
+              try {
+                const parsed = new URL(String(url), window.location.href);
+                sameOrigin = parsed.origin === window.location.origin;
+              } catch {}
             }
-            if (historySpamCount >= 2) {
-              reportBlock();
-              return;
+            if (sameOrigin) {
+              const now = Date.now();
+              if (now - historySpamWindowStart > 2000) {
+                historySpamWindowStart = now;
+                historySpamCount = 1;
+              } else {
+                historySpamCount += 1;
+              }
+              if (historySpamCount >= 2) {
+                reportBlock();
+                return;
+              }
             }
           }
         }
@@ -1611,7 +1681,6 @@
     });
     obs.observe(document, observerConfig);
 
-    // Giám sát cả các khung Shadow DOM tạo động chứa iframe quảng cáo
     try {
       const origAttachShadow = Element.prototype.attachShadow;
       if (typeof origAttachShadow === "function") {
