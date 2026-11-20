@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      17.0.0
-// @description  Kiến trúc bảo vệ tối đa: chống redirect trễ 4G/5G, khóa HTMLElement.prototype.click, ngụy trang native code và tối ưu player trên Orion iOS
+// @version      18.0.0
+// @description  Kiến trúc bảo vệ tối đa: khóa object/setAttribute srcdoc, chặn mượn danh redirect Google/FB, tối ưu SPA di động trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -96,10 +96,30 @@
   const isWhitelistedHost = (host, root) =>
     whitelist.some((d) => host === d || host.endsWith("." + d) || root === d);
 
+  const isKnownOpenRedirectUrl = (u) => {
+    try {
+      const p = new URL(u, window.location.href);
+      const h = p.hostname.toLowerCase().replace(/^www\./, "");
+      if ((h === "google.com" || h.endsWith(".google.com")) && (/^\/(url|amp\/s)\b/i.test(p.pathname) || p.searchParams.has("q"))) {
+        return true;
+      }
+      if ((h === "facebook.com" || h.endsWith(".facebook.com")) && /^\/(l\.php|flx\/warn)\b/i.test(p.pathname)) {
+        return true;
+      }
+      if ((h === "youtube.com" || h.endsWith(".youtube.com")) && /^\/redirect\b/i.test(p.pathname)) {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   const curHost = window.location.hostname.toLowerCase().replace(/^www\./, "");
   const curRoot = getRoot(curHost);
 
-  const checkBypassed = () => !enabled || isWhitelistedHost(curHost, curRoot);
+  const checkBypassed = () =>
+    !enabled || (isWhitelistedHost(curHost, curRoot) && !isKnownOpenRedirectUrl(window.location.href));
 
   const addBlock = () => {
     const latest = Number(getVal("gx_blocked_count", blockedCount)) || 0;
@@ -171,7 +191,7 @@
     }
   }
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (hỗ trợ cả chuỗi redirect trễ 4G/5G + no-referrer)
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -185,7 +205,7 @@
       const fromExternalSite =
         Boolean(refRoot) &&
         refRoot !== curRoot &&
-        !isWhitelistedHost(refHost, refRoot);
+        (!isWhitelistedHost(refHost, refRoot) || isKnownOpenRedirectUrl(document.referrer));
       const spawnedByOpener = Boolean(window.opener);
 
       const lastTouch = getVal("gx_last_touch", null);
@@ -301,7 +321,7 @@
     for (let i = 0; i < path.length; i++) {
       const node = path[i];
       if (!node || node.nodeType !== 1 || node === document.body || node === document.documentElement) break;
-      if (node.matches("video, audio, iframe, input, textarea, select, button, [role='button'], svg")) continue;
+      if (node.matches("video, audio, iframe, object, input, textarea, select, button, [role='button'], svg")) continue;
       if (node.closest && node.closest('[role="dialog"], [aria-modal="true"]')) continue;
       const r = node.getBoundingClientRect();
       if (r.width < 200 || r.height < 120) continue;
@@ -356,8 +376,20 @@
             const u = new URL(rawHref, window.location.href);
             const h = u.hostname.toLowerCase().replace(/^www\./, "");
             const r = getRoot(h);
-            const same = h === curHost || h.endsWith("." + curHost) || r === curRoot;
-            if (!e.isTrusted && !same) {
+            const isGateway =
+              (h === curHost || h.endsWith("." + curHost) || r === curRoot) &&
+              /^\/(go|out|away|redir|redirect|exit|jump|aff)(\/|\.|$)/i.test(u.pathname);
+            const same = (h === curHost || h.endsWith("." + curHost) || r === curRoot) && !isGateway;
+            const targetAttr = (n.getAttribute("target") || "").trim();
+            const opensNewTab = targetAttr && targetAttr !== "_self" && targetAttr !== "_parent" && targetAttr !== "_top";
+
+            if (!e.isTrusted && (!same || opensNewTab)) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+              addBlock();
+              return;
+            }
+            if (same && opensNewTab && u.href.split("#")[0] === window.location.href.split("#")[0]) {
               e.preventDefault();
               e.stopImmediatePropagation();
               addBlock();
@@ -460,10 +492,25 @@
         : p.slice(-2).join(".");
     };
 
+    const isOpenRedirectOnWhitelisted = (p) => {
+      const h = p.hostname.toLowerCase().replace(/^www\./, "");
+      if ((h === "google.com" || h.endsWith(".google.com")) && (/^\/(url|amp\/s)\b/i.test(p.pathname) || p.searchParams.has("q"))) {
+        return true;
+      }
+      if ((h === "facebook.com" || h.endsWith(".facebook.com")) && /^\/(l\.php|flx\/warn)\b/i.test(p.pathname)) {
+        return true;
+      }
+      if ((h === "youtube.com" || h.endsWith(".youtube.com")) && /^\/redirect\b/i.test(p.pathname)) {
+        return true;
+      }
+      return false;
+    };
+
     const isWhitelistedUrl = (u) => {
       try {
         const p = new URL(u, window.location.href);
         if (p.protocol !== "http:" && p.protocol !== "https:") return false;
+        if (isOpenRedirectOnWhitelisted(p)) return false;
         const h = p.hostname.toLowerCase().replace(/^www\./, "");
         const r = getInnerRoot(h);
         return wlList.some((d) => h === d || h.endsWith("." + d) || r === d);
@@ -589,7 +636,7 @@
     let touchMoved = false;
     let trustedGestureDepth = 0;
     let lastVerifiedTapTime = 0;
-    let lastNonLinkTapTime = 0;
+    let lastFormTypingTime = 0;
     let lastGestureTime = 0;
     let lastAttempt = 0;
     let touchStartX = 0;
@@ -608,7 +655,7 @@
 
     const isInjectedExternalAnchor = (anchor, sameClean) => {
       if (sameClean || !anchor) return false;
-      if (Date.now() - touchOriginTime >= 1500) return false;
+      if (Date.now() - touchOriginTime >= 4000) return false;
       if (touchOriginAnchor === anchor) {
         return touchOriginWasPseudo;
       }
@@ -640,7 +687,7 @@
 
     const isTargetExistingFrame = (targetName) => {
       if (!targetName) return false;
-      const frames = document.querySelectorAll("iframe[name], frame[name]");
+      const frames = document.querySelectorAll("iframe[name], frame[name], object[name]");
       for (let i = 0; i < frames.length; i++) {
         if (frames[i].getAttribute("name") === targetName) return true;
       }
@@ -687,6 +734,21 @@
       return m[1] !== undefined && parseFloat(m[1]) < 0.05;
     };
 
+    const hasOwnPseudoGraphic = (el) => {
+      for (const pseudo of ["::before", "::after"]) {
+        try {
+          const ps = window.getComputedStyle(el, pseudo);
+          if (ps && ps.content && ps.content !== "none" && ps.content !== '""') {
+            return true;
+          }
+          if (ps && ps.backgroundImage && ps.backgroundImage !== "none") {
+            return true;
+          }
+        } catch {}
+      }
+      return false;
+    };
+
     const hasVisibleGraphicChild = (el) => {
       const media = el.querySelectorAll("img, svg, picture, canvas");
       for (let i = 0; i < media.length; i++) {
@@ -705,12 +767,7 @@
         if (ir.width >= 6 && ir.height >= 6 && is.backgroundImage && is.backgroundImage !== "none") {
           return true;
         }
-        try {
-          const before = window.getComputedStyle(ic, "::before");
-          if (before && before.content && before.content !== "none" && before.content !== '""') {
-            return true;
-          }
-        } catch {}
+        if (hasOwnPseudoGraphic(ic)) return true;
       }
       return false;
     };
@@ -727,7 +784,7 @@
         parseFloat(s.fontSize) >= 8 &&
         !isTransparentColor(s.color);
       const hasBgImage = s.backgroundImage && s.backgroundImage !== "none" && r.width >= 16 && r.height >= 16;
-      return hasVisibleText || hasVisibleGraphicChild(a) || hasBgImage;
+      return hasVisibleText || hasVisibleGraphicChild(a) || hasBgImage || hasOwnPseudoGraphic(a);
     };
 
     function hasFullPseudoOverlay(el) {
@@ -758,7 +815,7 @@
         target === document.body ||
         target === document.documentElement ||
         target.matches(
-          "video, audio, iframe, frame, canvas, object, embed, input, textarea, select, option, button, [role='button'], svg, path"
+          "video, audio, iframe, frame, object, canvas, embed, input, textarea, select, option, button, [role='button'], svg, path"
         )
       ) {
         return false;
@@ -787,7 +844,6 @@
         insidePlayer;
       if (!isLargeOverlay) return false;
 
-      // Giữ nguyên lớp nhận thao tác Play/Pause của các trình phát video hợp lệ trừ khi bị đặt z-index quảng cáo cực cao
       if (insidePlayer) {
         const z = parseInt(s.zIndex, 10) || 0;
         const hasAdLink = target.tagName === "A" || Boolean(target.querySelector("a[href]"));
@@ -809,7 +865,7 @@
 
       const isEmptyTrap =
         target.innerText.trim().length === 0 &&
-        !target.querySelector("video, audio, canvas, iframe, input, button, [role='button'], svg, img");
+        !target.querySelector("video, audio, canvas, iframe, object, input, button, [role='button'], svg, img");
       if (!isEmptyTrap) return false;
 
       const isTransparentBg =
@@ -1119,11 +1175,18 @@
       return winProxy;
     }
 
+    // Chỉ bảo vệ chống mất dữ liệu đang nhập trong form, không gây hộp thoại giả khi duyệt SPA
+    const markFormTyping = (e) => {
+      if (e.isTrusted) lastFormTypingTime = Date.now();
+    };
+    window.addEventListener("input", markFormTyping, true);
+    window.addEventListener("change", markFormTyping, true);
+
     window.addEventListener("beforeunload", (e) => {
       if (bypassed) return;
-      const recentlyTappedEmptyArea = Date.now() - lastNonLinkTapTime < 3000;
-      if (recentlyTappedEmptyArea && allowMode === "NONE") {
-        reportBlock();
+      const hasUnsavedTyping = Date.now() - lastFormTypingTime < 30000;
+      const isUnauthorized = allowMode === "NONE" || Date.now() > allowedUntil;
+      if (hasUnsavedTyping && isUnauthorized) {
         e.preventDefault();
         e.returnValue = "";
       }
@@ -1191,7 +1254,6 @@
         lastVerifiedTapTime = Date.now();
       } else {
         resetAuth();
-        lastNonLinkTapTime = Date.now();
       }
     };
 
@@ -1263,8 +1325,6 @@
           const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
           if (authorize(e, wantsNewTab, 2500)) {
             lastVerifiedTapTime = Date.now();
-          } else {
-            lastNonLinkTapTime = Date.now();
           }
         }
         return;
@@ -1515,7 +1575,6 @@
         }
       } catch {}
 
-      // Khóa đồng bộ click giả lập trên cả <a>, <area> và HTMLElement.prototype.click.call(el)
       try {
         const guardElementClick = (el, origClickFn, args) => {
           if (!bypassed && el && el.nodeType === 1) {
@@ -1646,15 +1705,25 @@
         return;
       }
       if (node.nodeType !== 1) return;
-      if (node.tagName === "IFRAME" || node.tagName === "FRAME") {
+      if (node.tagName === "IFRAME" || node.tagName === "FRAME" || node.tagName === "OBJECT") {
         try { if (node.contentWindow) patchWindowEnvironment(node.contentWindow); } catch {}
       }
       if (node.querySelectorAll) {
-        node.querySelectorAll("iframe, frame").forEach((f) => {
+        node.querySelectorAll("iframe, frame, object").forEach((f) => {
           try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
         });
       }
     }
+
+    const injectBootIntoSrcdoc = (html) => {
+      if (!bypassed && typeof html === "string" && /<script\b/i.test(html)) {
+        const boot = "<script>try{parent.__gxPatchWin&&parent.__gxPatchWin(window)}catch(e){}</script>";
+        return /<head\b[^>]*>/i.test(html)
+          ? html.replace(/<head\b[^>]*>/i, (m) => m + boot)
+          : boot + html;
+      }
+      return html;
+    };
 
     try {
       const sdDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "srcdoc");
@@ -1663,25 +1732,34 @@
           configurable: true,
           get: sdDesc.get,
           set: function (html) {
-            let patchedHtml = html;
-            if (!bypassed && typeof html === "string" && /<script\b/i.test(html)) {
-              const boot = "<script>try{parent.__gxPatchWin&&parent.__gxPatchWin(window)}catch(e){}</script>";
-              patchedHtml = /<head\b[^>]*>/i.test(html)
-                ? html.replace(/<head\b[^>]*>/i, (m) => m + boot)
-                : boot + html;
-            }
-            sdDesc.set.call(this, patchedHtml);
+            sdDesc.set.call(this, injectBootIntoSrcdoc(html));
             try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
           }
         });
       }
     } catch {}
 
+    try {
+      const origSetAttr = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = maskAsNative(function (name, value) {
+        if (!bypassed && this && this.tagName === "IFRAME" && /^srcdoc$/i.test(String(name))) {
+          const res = origSetAttr.call(this, name, injectBootIntoSrcdoc(String(value)));
+          try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
+          return res;
+        }
+        const res = origSetAttr.apply(this, arguments);
+        if (!bypassed && this && this.tagName === "OBJECT" && /^data$/i.test(String(name))) {
+          try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
+        }
+        return res;
+      }, "setAttribute");
+    } catch {}
+
     window.addEventListener(
       "load",
       (e) => {
         const t = e.target;
-        if (t && (t.tagName === "IFRAME" || t.tagName === "FRAME")) {
+        if (t && (t.tagName === "IFRAME" || t.tagName === "FRAME" || t.tagName === "OBJECT")) {
           try { if (t.contentWindow) patchWindowEnvironment(t.contentWindow); } catch {}
         }
       },
@@ -1726,7 +1804,7 @@
           set: function (html) {
             const parent = this.parentElement;
             ohDesc.set.call(this, html);
-            if (parent && typeof html === "string" && /<i?frame\b/i.test(html)) {
+            if (parent && typeof html === "string" && /<(?:i?frame|object)\b/i.test(html)) {
               patchFrameTree(parent);
             }
           }
@@ -1739,7 +1817,7 @@
       if (typeof origInsertAdjHTML === "function") {
         Element.prototype.insertAdjacentHTML = function (pos, html) {
           const res = origInsertAdjHTML.apply(this, arguments);
-          if (typeof html === "string" && /<i?frame\b/i.test(html)) {
+          if (typeof html === "string" && /<(?:i?frame|object)\b/i.test(html)) {
             patchFrameTree(this.parentElement || this);
           }
           return res;
@@ -1782,6 +1860,20 @@
             const cd = cdDesc.get.call(this);
             try { if (cd && cd.defaultView) patchWindowEnvironment(cd.defaultView); } catch {}
             return cd;
+          }
+        });
+      }
+    } catch {}
+
+    try {
+      const objCwDesc = Object.getOwnPropertyDescriptor(HTMLObjectElement.prototype, "contentWindow");
+      if (objCwDesc && objCwDesc.get) {
+        Object.defineProperty(HTMLObjectElement.prototype, "contentWindow", {
+          configurable: true,
+          get: function () {
+            const cw = objCwDesc.get.call(this);
+            try { if (cw) patchWindowEnvironment(cw); } catch {}
+            return cw;
           }
         });
       }
@@ -1879,14 +1971,14 @@
         sanitizeBaseTag(node);
         return;
       }
-      if (tag === "IFRAME" || tag === "FRAME") {
+      if (tag === "IFRAME" || tag === "FRAME" || tag === "OBJECT") {
         try { if (node.contentWindow) patchWindowEnvironment(node.contentWindow); } catch {}
         return;
       }
       if (node.firstElementChild) {
         node.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => m.remove());
         node.querySelectorAll("base").forEach(sanitizeBaseTag);
-        node.querySelectorAll("iframe, frame").forEach((f) => {
+        node.querySelectorAll("iframe, frame, object").forEach((f) => {
           try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
         });
       }
@@ -1896,7 +1988,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["http-equiv", "target", "href"]
+      attributeFilter: ["http-equiv", "target", "href", "srcdoc", "data"]
     };
 
     const obs = new MutationObserver((mutations) => {
