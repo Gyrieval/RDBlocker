@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      19.0.0
-// @description  Kiến trúc bảo vệ toàn diện: khóa dispatchEvent trên detached node, lọc ký tự điều khiển URL, chống trễ đồng bộ tab iOS và hỗ trợ OAuth trên Orion
+// @version      20.0.0
+// @description  Kiến trúc bảo vệ tối đa: vá race-condition touchstart/no-referrer, khóa replaceState, chống bẫy gradient và hoàn thiện fakeWin trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -100,7 +100,7 @@
     try {
       const p = new URL(u, window.location.href);
       const h = p.hostname.toLowerCase().replace(/^www\./, "");
-      if ((h === "google.com" || h.endsWith(".google.com")) && (/^\/(url|amp\/s)\b/i.test(p.pathname) || p.searchParams.has("q"))) {
+      if (/^([a-z0-9-]+\.)*google\.[a-z.]{2,6}$/i.test(h) && /^\/(url|amp\/s)\b/i.test(p.pathname)) {
         return true;
       }
       if ((h === "facebook.com" || h.endsWith(".facebook.com")) && /^\/(l\.php|flx\/warn)\b/i.test(p.pathname)) {
@@ -200,7 +200,7 @@
     );
   };
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (bắt cả redirect ngay tại touchstart + no-referrer)
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -220,7 +220,7 @@
       const lastTouch = getVal("gx_last_touch", null);
       const spawnedRightAfterTouch =
         Boolean(lastTouch) &&
-        Date.now() - lastTouch.time < 4500 &&
+        Date.now() - lastTouch.time < 5000 &&
         Boolean(lastTouch.root) &&
         lastTouch.root !== curRoot &&
         !isWhitelistedHost(lastTouch.host, lastTouch.root);
@@ -256,17 +256,22 @@
           }
         };
 
-        // Đợi 60ms để đồng bộ trạng thái GM_setValue giữa 2 tab trên iOS trước khi đóng tab
         setTimeout(finalizeBlockNavigation, 60);
       }
     } catch {}
   }
 
-  const recordTouchActivity = () => {
-    if (!checkBypassed() && curRoot) {
-      setVal("gx_last_touch", { host: curHost, root: curRoot, time: Date.now() });
-    }
+  let lastTouchRecordMs = 0;
+  const recordTouchActivity = (e) => {
+    if (e && e.isTrusted === false) return;
+    if (checkBypassed() || !curRoot) return;
+    const now = Date.now();
+    if (now - lastTouchRecordMs < 150) return;
+    lastTouchRecordMs = now;
+    setVal("gx_last_touch", { host: curHost, root: curRoot, time: now });
   };
+  window.addEventListener("touchstart", recordTouchActivity, true);
+  window.addEventListener("pointerdown", recordTouchActivity, true);
   window.addEventListener("touchend", recordTouchActivity, true);
   window.addEventListener("pointerup", recordTouchActivity, true);
 
@@ -340,9 +345,9 @@
       const s = window.getComputedStyle(node);
       if (s.position !== "fixed" && s.position !== "absolute") continue;
       const opacity = parseFloat(s.opacity);
-      if ((node.tagName === "IMG" || node.tagName === "LABEL") && opacity >= 0.08) continue;
+      if ((node.tagName === "IMG" || node.tagName === "LABEL") && opacity >= 0.15) continue;
       const isTransparent =
-        opacity < 0.08 ||
+        opacity < 0.15 ||
         ((s.backgroundColor === "rgba(0, 0, 0, 0)" || s.backgroundColor === "transparent") &&
           s.backgroundImage === "none" &&
           node.innerText.trim().length === 0 &&
@@ -509,7 +514,7 @@
 
     const isOpenRedirectOnWhitelisted = (p) => {
       const h = p.hostname.toLowerCase().replace(/^www\./, "");
-      if ((h === "google.com" || h.endsWith(".google.com")) && (/^\/(url|amp\/s)\b/i.test(p.pathname) || p.searchParams.has("q"))) {
+      if (/^([a-z0-9-]+\.)*google\.[a-z.]{2,6}$/i.test(h) && /^\/(url|amp\/s)\b/i.test(p.pathname)) {
         return true;
       }
       if ((h === "facebook.com" || h.endsWith(".facebook.com")) && /^\/(l\.php|flx\/warn)\b/i.test(p.pathname)) {
@@ -749,6 +754,18 @@
       return m[1] !== undefined && parseFloat(m[1]) < 0.05;
     };
 
+    const isTransparentBackground = (s) => {
+      const bgColorTransparent = isTransparentColor(s.backgroundColor);
+      if (!bgColorTransparent) return false;
+      const bgImg = s.backgroundImage || "none";
+      if (bgImg === "none") return true;
+      if (/gradient\(/i.test(bgImg) && !/url\(/i.test(bgImg)) {
+        const stops = bgImg.match(/rgba?\([^)]+\)|#[0-9a-f]{3,8}|\btransparent\b/gi) || [];
+        return stops.length > 0 && stops.every((c) => isTransparentColor(c));
+      }
+      return false;
+    };
+
     const hasOwnPseudoGraphic = (el) => {
       for (const pseudo of ["::before", "::after"]) {
         try {
@@ -815,7 +832,7 @@
           if (
             pw >= Math.min(window.innerWidth * 0.6, 220) &&
             ph >= Math.min(window.innerHeight * 0.25, 140) &&
-            (opacity < 0.08 || isTransparentColor(ps.backgroundColor))
+            (opacity < 0.15 || isTransparentColor(ps.backgroundColor))
           ) {
             return true;
           }
@@ -862,13 +879,13 @@
       if (insidePlayer) {
         const z = parseInt(s.zIndex, 10) || 0;
         const hasAdLink = target.tagName === "A" || Boolean(target.querySelector("a[href]"));
-        if (!hasAdLink && z < 9999 && parseFloat(s.opacity) >= 0.08) {
+        if (!hasAdLink && z < 9999 && parseFloat(s.opacity) >= 0.15) {
           return false;
         }
       }
 
       const opacity = parseFloat(s.opacity);
-      if (opacity < 0.08) {
+      if (opacity < 0.15) {
         try {
           target.style.setProperty("pointer-events", "none", "important");
         } catch {}
@@ -883,12 +900,7 @@
         !target.querySelector("video, audio, canvas, iframe, object, input, button, [role='button'], svg, img");
       if (!isEmptyTrap) return false;
 
-      const isTransparentBg =
-        isTransparentColor(s.backgroundColor) &&
-        s.backgroundImage === "none" &&
-        parseFloat(s.borderTopWidth) === 0;
-
-      if (isTransparentBg) {
+      if (isTransparentBackground(s) && parseFloat(s.borderTopWidth) === 0) {
         try {
           target.style.setProperty("pointer-events", "none", "important");
         } catch {}
@@ -1047,7 +1059,6 @@
         return false;
       }
 
-      // Chặn iframe con tự ý ép đổi hướng toàn bộ cửa sổ chính (_top / _parent) khi không có thao tác người dùng
       if (callerWin && callerWin !== window && !hasActiveUserGesture() && expired) {
         return false;
       }
@@ -1094,7 +1105,7 @@
 
       const inspectWrittenOAuth = (htmlChunk) => {
         if (!promotionOpts || promoted || typeof htmlChunk !== "string") return;
-        const match = htmlChunk.match(/(?:action|href|url|location(?:\.href)?)\s*=\s*["']?(https?:\/\/[^"'\s>]+)/i);
+        const match = htmlChunk.match(/(?:<form[^>]+action|location(?:\.href)?)\s*=\s*["']?(https?:\/\/[^"'\s>]+)/i);
         if (match && match[1]) {
           tryPromoteBlank(match[1]);
         }
@@ -1135,8 +1146,9 @@
         style: {},
         setAttribute() {},
         getAttribute() { return null; },
-        appendChild() {},
-        removeChild() {},
+        appendChild(c) { return c; },
+        insertBefore(c) { return c; },
+        removeChild(c) { return c; },
         click() {},
         focus() {}
       });
@@ -1144,6 +1156,7 @@
         body: dummyEl(),
         documentElement: dummyEl(),
         head: dummyEl(),
+        location: fakeLoc,
         defaultView: null,
         readyState: "complete",
         write(s) { inspectWrittenOAuth(s); },
@@ -1511,7 +1524,6 @@
       });
     } catch {}
 
-    // Chặn kịch bản gọi dispatchEvent(new MouseEvent('click')) trên thẻ <a> nằm ngoài DOM hoặc Shadow DOM
     try {
       const origDispatch = EventTarget.prototype.dispatchEvent;
       EventTarget.prototype.dispatchEvent = maskAsNative(function (ev) {
@@ -1685,6 +1697,18 @@
             }, "click")
           });
         }
+
+        const svgAProto = w.SVGAElement && w.SVGAElement.prototype;
+        if (svgAProto && svgAProto.click && (!htmlElProto || svgAProto.click !== htmlElProto.click)) {
+          const origSvgAClick = svgAProto.click;
+          Object.defineProperty(svgAProto, "click", {
+            configurable: true,
+            writable: true,
+            value: maskAsNative(function () {
+              return guardElementClick(this, origSvgAClick, arguments);
+            }, "click")
+          });
+        }
       } catch {}
 
       try {
@@ -1852,6 +1876,22 @@
     });
 
     try {
+      const ihDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+      if (ihDesc && ihDesc.set) {
+        Object.defineProperty(Element.prototype, "innerHTML", {
+          configurable: true,
+          get: ihDesc.get,
+          set: function (html) {
+            ihDesc.set.call(this, html);
+            if (typeof html === "string" && html.indexOf("<") !== -1 && /<(?:i?frame|object)\b/i.test(html)) {
+              patchFrameTree(this);
+            }
+          }
+        });
+      }
+    } catch {}
+
+    try {
       const ohDesc = Object.getOwnPropertyDescriptor(Element.prototype, "outerHTML");
       if (ohDesc && ohDesc.set) {
         Object.defineProperty(Element.prototype, "outerHTML", {
@@ -1938,35 +1978,40 @@
     try {
       let historySpamCount = 0;
       let historySpamWindowStart = 0;
-      const origPushState = History.prototype.pushState;
-      History.prototype.pushState = maskAsNative(function (state, title, url) {
-        if (!bypassed) {
-          const noUserGesture = Date.now() - lastGestureTime > 1500;
-          if (noUserGesture) {
-            let sameOrigin = true;
-            if (url) {
-              try {
-                const parsed = new URL(String(url), window.location.href);
-                sameOrigin = parsed.origin === window.location.origin;
-              } catch {}
-            }
-            if (sameOrigin) {
-              const now = Date.now();
-              if (now - historySpamWindowStart > 1500) {
-                historySpamWindowStart = now;
-                historySpamCount = 1;
-              } else {
-                historySpamCount += 1;
+      const guardHistoryMutate = (origFn, name) =>
+        maskAsNative(function (state, title, url) {
+          if (!bypassed) {
+            const noUserGesture = Date.now() - lastGestureTime > 1500;
+            if (noUserGesture) {
+              let sameOrigin = true;
+              if (url) {
+                try {
+                  const parsed = new URL(String(url), window.location.href);
+                  sameOrigin = parsed.origin === window.location.origin;
+                } catch {}
               }
-              if (historySpamCount >= 3) {
-                reportBlock();
-                return;
+              if (sameOrigin) {
+                const now = Date.now();
+                if (now - historySpamWindowStart > 1500) {
+                  historySpamWindowStart = now;
+                  historySpamCount = 1;
+                } else {
+                  historySpamCount += 1;
+                }
+                if (historySpamCount >= 3) {
+                  reportBlock();
+                  return;
+                }
               }
             }
           }
-        }
-        return origPushState.apply(this, arguments);
-      }, "pushState");
+          return origFn.apply(this, arguments);
+        }, name);
+
+      History.prototype.pushState = guardHistoryMutate(History.prototype.pushState, "pushState");
+      if (typeof History.prototype.replaceState === "function") {
+        History.prototype.replaceState = guardHistoryMutate(History.prototype.replaceState, "replaceState");
+      }
     } catch {}
 
     const sanitizeWrittenHtml = (args) => {
