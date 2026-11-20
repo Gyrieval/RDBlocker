@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      25.0.0
-// @description  Vá lỗi không tải được ảnh CDN/Base64, tối ưu lazy-load ảnh, chặn redirect/pop-under và bẫy tàng hình trên Orion iOS
+// @version      26.0.0
+// @description  Vá triệt để lỗi tải ảnh (không ngắt kết nối sớm, hỗ trợ iframe ảnh Base64/canvas), chặn redirect/pop-under trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -226,12 +226,12 @@
     const legitNav = getVal("gx_legit_nav", null);
     return Boolean(
       legitNav &&
-        Date.now() - legitNav.time < 8000 &&
+        Date.now() - legitNav.time < 10000 &&
         (legitNav.anyExternal || legitNav.root === curRoot || legitNav.host === curHost)
     );
   };
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
+  // Lớp bảo vệ tầng điều hướng: chỉ gọi window.stop() sau khi xác nhận không phải điều hướng hợp lệ (tránh cắt đứt tải ảnh)
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -265,15 +265,27 @@
         !isWhitelistedHost(lastTouch.host, lastTouch.root);
 
       if ((fromExternalSite || spawnedByOpener || spawnedRightAfterTouch) && !isMatchedLegitNav()) {
-        try { window.stop(); } catch {}
-        silencePageMedia();
+        const rootEl = document.documentElement;
+        const prevVisibility = rootEl ? rootEl.style.visibility : "";
+        if (rootEl) {
+          try { rootEl.style.visibility = "hidden"; } catch {}
+        }
 
         const finalizeBlockNavigation = () => {
           if (isMatchedLegitNav()) {
-            window.location.reload();
+            if (rootEl) {
+              try { rootEl.style.visibility = prevVisibility; } catch {}
+            }
             return;
           }
+
+          try { window.stop(); } catch {}
+          silencePageMedia();
+          if (rootEl) {
+            try { rootEl.style.visibility = prevVisibility; } catch {}
+          }
           addBlock();
+
           if (window.history.length <= 2 || spawnedByOpener) {
             try { window.close(); } catch {}
             showLoopGuardBanner(curRoot || curHost, document.referrer, true);
@@ -295,7 +307,7 @@
           }
         };
 
-        setTimeout(finalizeBlockNavigation, 60);
+        setTimeout(finalizeBlockNavigation, 75);
       }
     } catch {}
   }
@@ -314,7 +326,6 @@
   window.addEventListener("touchend", recordTouchActivity, true);
   window.addEventListener("pointerup", recordTouchActivity, true);
 
-  // Ghi nhận ý định điều hướng khi người dùng bấm kết quả trên trang tìm kiếm / trang Whitelist
   window.addEventListener(
     "click",
     (e) => {
@@ -543,13 +554,17 @@
       return;
     }
     if (node.firstElementChild) {
-      node.querySelectorAll("meta[http-equiv]").forEach((m) => {
-        if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
-      });
-      node.querySelectorAll("base[target]").forEach((b) => {
-        const t = (b.getAttribute("target") || "").trim();
-        if (t && t !== "_self" && t !== "_parent" && t !== "_top") b.removeAttribute("target");
-      });
+      if (node.getElementsByTagName("meta").length > 0) {
+        node.querySelectorAll("meta[http-equiv]").forEach((m) => {
+          if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
+        });
+      }
+      if (node.getElementsByTagName("base").length > 0) {
+        node.querySelectorAll("base[target]").forEach((b) => {
+          const t = (b.getAttribute("target") || "").trim();
+          if (t && t !== "_self" && t !== "_parent" && t !== "_top") b.removeAttribute("target");
+        });
+      }
     }
   };
 
@@ -1946,7 +1961,7 @@
         if (node.tagName === "IFRAME") sanitizeSandboxAttr(node);
         try { if (node.contentWindow) patchWindowEnvironment(node.contentWindow); } catch {}
       }
-      if (node.querySelectorAll) {
+      if (node.querySelectorAll && (node.getElementsByTagName("iframe").length > 0 || node.getElementsByTagName("frame").length > 0 || node.getElementsByTagName("object").length > 0)) {
         node.querySelectorAll("iframe, frame, object").forEach((f) => {
           if (f.tagName === "IFRAME") sanitizeSandboxAttr(f);
           try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
@@ -1954,6 +1969,7 @@
       }
     }
 
+    // Chỉ chặn data:text/html iframe khi thực sự ép điều hướng khung cha (top/parent) hoặc meta refresh, giữ nguyên khung ảnh/canvas
     const isDangerousIframeSrc = (rawUrl) => {
       if (bypassed || hasActiveUserGesture()) return false;
       const cleanOrig = sanitizeRawUrl(rawUrl);
@@ -1966,12 +1982,12 @@
         if (b64Idx !== -1) {
           try {
             const decodedHtml = atob(cleanOrig.slice(b64Idx + 8, b64Idx + 8200));
-            return /<script|location\s*[.=]|window\.open|http-equiv\s*=\s*["']?refresh/i.test(decodedHtml);
+            return /(?:top|parent)\.location|http-equiv\s*=\s*["']?refresh/i.test(decodedHtml);
           } catch {
-            return true;
+            return false;
           }
         }
-        return /<script|location|window\.open|http-equiv/i.test(lower);
+        return /(?:top|parent)\.location|http-equiv\s*=\s*["']?refresh/i.test(lower);
       }
       return false;
     };
@@ -1979,9 +1995,16 @@
     const injectBootIntoSrcdoc = (html) => {
       if (!bypassed && typeof html === "string" && /<script\b/i.test(html)) {
         const boot = "<script>try{parent.__gxPatchWin&&parent.__gxPatchWin(window)}catch(e){}</script>";
-        return /<head\b[^>]*>/i.test(html)
-          ? html.replace(/<head\b[^>]*>/i, (m) => m + boot)
-          : boot + html;
+        if (/<head\b[^>]*>/i.test(html)) {
+          return html.replace(/<head\b[^>]*>/i, (m) => m + boot);
+        }
+        if (/<html\b[^>]*>/i.test(html)) {
+          return html.replace(/<html\b[^>]*>/i, (m) => m + boot);
+        }
+        if (/<!doctype\b[^>]*>/i.test(html)) {
+          return html.replace(/<!doctype\b[^>]*>/i, (m) => m + boot);
+        }
+        return boot + html;
       }
       return html;
     };
@@ -2268,7 +2291,6 @@
       }
     } catch {}
 
-    // Chỉ xóa target="_blank" trên thẻ <base>, giữ nguyên <base href="..."> để không làm hỏng đường dẫn ảnh CDN
     const sanitizeBaseTag = (b) => {
       const t = (b.getAttribute("target") || "").trim();
       if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
@@ -2293,14 +2315,24 @@
       if (!node || node.nodeType !== 1) return;
       sanitizeSingleElement(node);
       if (node.firstElementChild) {
-        node.querySelectorAll("meta[http-equiv]").forEach((m) => {
-          if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
-        });
-        node.querySelectorAll("base[target]").forEach(sanitizeBaseTag);
-        node.querySelectorAll("iframe, frame, object").forEach((f) => {
-          if (f.tagName === "IFRAME") sanitizeSandboxAttr(f);
-          try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
-        });
+        if (node.getElementsByTagName("meta").length > 0) {
+          node.querySelectorAll("meta[http-equiv]").forEach((m) => {
+            if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
+          });
+        }
+        if (node.getElementsByTagName("base").length > 0) {
+          node.querySelectorAll("base[target]").forEach(sanitizeBaseTag);
+        }
+        if (
+          node.getElementsByTagName("iframe").length > 0 ||
+          node.getElementsByTagName("frame").length > 0 ||
+          node.getElementsByTagName("object").length > 0
+        ) {
+          node.querySelectorAll("iframe, frame, object").forEach((f) => {
+            if (f.tagName === "IFRAME") sanitizeSandboxAttr(f);
+            try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
+          });
+        }
       }
     };
 
