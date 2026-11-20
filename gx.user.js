@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      7.1.0
-// @description  Chặn chuyển hướng toàn diện, chống bẫy trong suốt, khóa tráo link động và ngắt vòng lặp redirect trên Orion iOS
+// @version      8.0.0
+// @description  Chặn chuyển hướng toàn diện, chống bẫy pseudo-element, khóa cổng redirect nội bộ và tương thích SPA trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -105,7 +105,7 @@
       allowBtn.style.cssText =
         "background:#27272a;color:#e4e4e7;border:1px solid #52525b;border-radius:8px;padding:6px 12px;font-size:13px;";
       allowBtn.onclick = () => {
-        setVal("gx_legit_nav", { host: curHost, root: curRoot, time: Date.now() });
+        setVal("gx_legit_nav", { host: curHost, root: curRoot, anyExternal: false, time: Date.now() });
         window.location.reload();
       };
 
@@ -156,7 +156,7 @@
       const spawnedRightAfterTouch =
         window.history.length <= 3 &&
         lastTouch &&
-        Date.now() - lastTouch.time < 1500 &&
+        Date.now() - lastTouch.time < 1200 &&
         Boolean(lastTouch.root) &&
         lastTouch.root !== curRoot &&
         !isWhitelistedHost(lastTouch.host, lastTouch.root);
@@ -164,8 +164,8 @@
       const legitNav = getVal("gx_legit_nav", null);
       const isUserIntendedNav =
         legitNav &&
-        Date.now() - legitNav.time < 12000 &&
-        (legitNav.root === curRoot || legitNav.host === curHost);
+        Date.now() - legitNav.time < 10000 &&
+        (legitNav.anyExternal || legitNav.root === curRoot || legitNav.host === curHost);
 
       if ((fromExternalSite || spawnedByOpener || spawnedRightAfterTouch) && !isUserIntendedNav) {
         addBlock();
@@ -252,6 +252,7 @@
         setVal("gx_legit_nav", {
           host: e.data.host || "",
           root: e.data.root || "",
+          anyExternal: Boolean(e.data.anyExternal),
           time: Date.now()
         });
       }
@@ -285,7 +286,7 @@
               return;
             }
             if (!same) {
-              setVal("gx_legit_nav", { host: h, root: r, time: Date.now() });
+              setVal("gx_legit_nav", { host: h, root: r, anyExternal: false, time: Date.now() });
             }
           } catch {}
           return;
@@ -337,16 +338,17 @@
       }
     };
 
-    const reportLegitExternalNav = (targetUrl) => {
+    const reportLegitExternalNav = (targetUrl, anyExternal = false) => {
       try {
-        const u = new URL(targetUrl, window.location.href);
+        const u = new URL(targetUrl || window.location.href, window.location.href);
         const h = u.hostname.toLowerCase().replace(/^www\./, "");
         nativePost(
           {
             __gxToken: token,
             type: "GX_LEGIT_NAV",
             host: h,
-            root: getInnerRoot(h)
+            root: getInnerRoot(h),
+            anyExternal
           },
           "*"
         );
@@ -369,6 +371,19 @@
         if (p.protocol === "blob:" || p.protocol === "data:") return true;
         const h = p.hostname.toLowerCase().replace(/^www\./, "");
         return h === hostName || h.endsWith("." + hostName) || getInnerRoot(h) === rootDomain;
+      } catch {
+        return false;
+      }
+    };
+
+    // Phát hiện cổng chuyển tiếp quảng cáo nội bộ (/out?url=http..., /go/..., /redirect...)
+    const isRedirectGateway = (u) => {
+      try {
+        const p = new URL(u, window.location.href);
+        if (!isSameSite(u)) return false;
+        const pathMatch = /^\/(go|out|away|redir|redirect|exit|jump|aff)\b/i.test(p.pathname);
+        const queryMatch = /(?:^|[?&])(url|to|dest|destination|target|redirect|redir|link)=https?%3A|https?:\/\//i.test(p.search);
+        return pathMatch || queryMatch;
       } catch {
         return false;
       }
@@ -448,6 +463,31 @@
       );
     };
 
+    // Kiểm tra cả lớp phủ thật lẫn lớp phủ giả ::before / ::after phủ kín màn hình
+    function hasFullPseudoOverlay(el) {
+      for (const pseudo of ["::before", "::after"]) {
+        try {
+          const ps = window.getComputedStyle(el, pseudo);
+          if (!ps || ps.content === "none" || ps.content === "") continue;
+          if (ps.position !== "fixed" && ps.position !== "absolute") continue;
+          const pw = parseFloat(ps.width) || 0;
+          const ph = parseFloat(ps.height) || 0;
+          const opacity = parseFloat(ps.opacity);
+          const isTransparent =
+            ps.backgroundColor === "rgba(0, 0, 0, 0)" ||
+            ps.backgroundColor === "transparent";
+          if (
+            pw >= window.innerWidth * 0.65 &&
+            ph >= window.innerHeight * 0.55 &&
+            (opacity < 0.08 || isTransparent)
+          ) {
+            return true;
+          }
+        } catch {}
+      }
+      return false;
+    }
+
     function neutralizeInvisibleTrap(target) {
       if (!target || target.nodeType !== 1) return false;
       if (
@@ -461,6 +501,14 @@
       }
       if (target.closest && target.closest('[class*="player" i], [id*="player" i], [role="dialog"], [aria-modal="true"]')) {
         return false;
+      }
+
+      if (hasFullPseudoOverlay(target)) {
+        try {
+          target.style.setProperty("pointer-events", "none", "important");
+        } catch {}
+        reportBlock();
+        return true;
       }
 
       const s = window.getComputedStyle(target);
@@ -501,7 +549,7 @@
         const form = e.target;
         if (!form || form.tagName !== "FORM") return;
         const actionUrl = form.getAttribute("action") || window.location.href;
-        const safeDest = isSameSite(actionUrl) || isWhitelistedUrl(actionUrl);
+        const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
 
         if (!e.isTrusted && !safeDest && !isAllowed(actionUrl, opensNew(form))) {
           e.preventDefault();
@@ -514,7 +562,7 @@
           allowedUrl = actionUrl;
           allowedUntil = Date.now() + 5000;
           if (!isSameSite(actionUrl)) {
-            reportLegitExternalNav(actionUrl);
+            reportLegitExternalNav(actionUrl, false);
           }
         }
       },
@@ -544,15 +592,19 @@
           ) {
             button = n;
             nativeBtn = true;
-          } else if (
-            i < 7 &&
-            (window.getComputedStyle(n).cursor === "pointer" ||
-              n.hasAttribute("data-href") ||
-              n.hasAttribute("data-url") ||
-              n.hasAttribute("aria-label") ||
-              n.hasAttribute("aria-expanded"))
-          ) {
-            button = n;
+          } else if (i < 5) {
+            // Chỉ nhận diện phần tử có kích thước nút thật sự để tránh bẫy body { cursor: pointer }
+            const r = n.getBoundingClientRect();
+            const compactControl = r.width > 0 && r.height > 0 && r.width < window.innerWidth * 0.5 && r.height < window.innerHeight * 0.35;
+            if (
+              compactControl &&
+              (window.getComputedStyle(n).cursor === "pointer" ||
+                n.hasAttribute("data-href") ||
+                n.hasAttribute("data-url") ||
+                n.hasAttribute("aria-expanded"))
+            ) {
+              button = n;
+            }
           }
         }
       }
@@ -563,7 +615,8 @@
       const { anchor, button, nativeBtn } = findControls(e);
       if (anchor && !isPseudo(anchor)) {
         const href = getAnchorHref(anchor);
-        const same = isSameSite(href);
+        const gateway = isRedirectGateway(href);
+        const same = isSameSite(href) && !gateway;
         if (same || isRealExtLink(anchor)) {
           lockedA = anchor;
           lockedHref = href;
@@ -571,12 +624,12 @@
           allowedUntil = Date.now() + dur;
           if (wantsNewTab) {
             allowMode = "NEW_TAB";
-            if (!same) reportLegitExternalNav(lockedHref);
+            if (!same) reportLegitExternalNav(lockedHref, gateway);
           } else if (same) {
             allowMode = "DOMAIN";
           } else {
             allowMode = "EXT_LINK";
-            reportLegitExternalNav(lockedHref);
+            reportLegitExternalNav(lockedHref, gateway);
           }
           return true;
         }
@@ -586,12 +639,12 @@
         if (
           r.width > 0 &&
           r.height > 0 &&
-          r.width < window.innerWidth * 0.7 &&
+          r.width < window.innerWidth * 0.65 &&
           (nativeBtn || button.innerText.trim().length > 0 || button.querySelector("img, svg, i, span"))
         ) {
           allowMode = "BUTTON";
           allowedUrl = null;
-          allowedUntil = Date.now() + (nativeBtn ? 3000 : 1800);
+          allowedUntil = Date.now() + (nativeBtn ? 2800 : 1600);
           return true;
         }
       }
@@ -613,25 +666,31 @@
       if (bypassed) return true;
       if (!url) return false;
       if (url.startsWith("blob:") || url.startsWith("data:")) return true;
+      if (/^javascript:/i.test(url.trim())) return false;
 
       const selfClone = normUrl(url) === normUrl(window.location.href);
+      const gateway = isRedirectGateway(url);
+      const sameClean = isSameSite(url) && !gateway;
       const expired = Date.now() > allowedUntil || allowMode === "NONE";
 
       if (isNewTab) {
         if (expired) return false;
-        if (allowMode === "NEW_TAB") return true;
+        // Chỉ cho phép mở tab mới đúng tên miền của liên kết đã nhấn giữ hoặc trang trong Whitelist
+        if (allowMode === "NEW_TAB") {
+          return allowedUrl ? matchesAllowedHost(url) || isWhitelistedUrl(url) : isWhitelistedUrl(url);
+        }
         if (allowMode === "EXT_LINK") return matchesAllowedHost(url) || isWhitelistedUrl(url);
         if (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") return isWhitelistedUrl(url);
         return false;
       }
 
-      if (!isSameSite(url) && Date.now() - lastAttempt < 1500) return false;
-      if (!selfClone && isSameSite(url)) return true;
+      if (!sameClean && Date.now() - lastAttempt < 1500) return false;
+      if (!selfClone && sameClean) return true;
 
       if (!expired) {
-        if (allowMode === "NEW_TAB") return true;
+        if (allowMode === "NEW_TAB") return allowedUrl ? matchesAllowedHost(url) || isWhitelistedUrl(url) : false;
         if ((allowMode === "DOMAIN" || allowMode === "EXT_LINK") && matchesAllowedHost(url)) return true;
-        if ((allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") && (isSameSite(url) || isWhitelistedUrl(url))) {
+        if ((allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") && (sameClean || isWhitelistedUrl(url))) {
           return true;
         }
       }
@@ -714,7 +773,7 @@
     );
 
     window.addEventListener("contextmenu", (e) => {
-      if (e.isTrusted && !bypassed) authorize(e, true, 15000);
+      if (e.isTrusted && !bypassed) authorize(e, true, 12000);
     }, true);
 
     document.addEventListener(
@@ -737,19 +796,19 @@
           return;
         }
 
-        // Khôi phục ngay href gốc nếu trang web tráo đích đến sau khi chạm tay
         let href = getAnchorHref(anchor);
         if (lockedA === anchor && lockedHref && href !== lockedHref) {
           try { anchor.setAttribute("href", lockedHref); } catch {}
           href = lockedHref;
         }
 
-        const same = isSameSite(href);
+        const gateway = isRedirectGateway(href);
+        const sameClean = isSameSite(href) && !gateway;
         const selfClone = normUrl(href) === normUrl(window.location.href);
         const newTab = opensNew(anchor);
 
         const wasInjectedMidTap =
-          !same &&
+          !sameClean &&
           Date.now() - touchOriginTime < 1200 &&
           touchOriginAnchor !== anchor &&
           (!touchOriginTarget || !anchor.contains(touchOriginTarget));
@@ -769,7 +828,7 @@
           return;
         }
 
-        if (same) {
+        if (sameClean) {
           if (newTab && allowMode !== "NEW_TAB") {
             try { anchor.setAttribute("target", "_self"); } catch {}
           }
@@ -783,7 +842,7 @@
           return;
         }
 
-        reportLegitExternalNav(href);
+        reportLegitExternalNav(href, gateway);
       },
       true
     );
@@ -822,8 +881,11 @@
     [
       [Node.prototype, "appendChild"],
       [Node.prototype, "insertBefore"],
+      [Node.prototype, "replaceChild"],
       [Element.prototype, "append"],
       [Element.prototype, "prepend"],
+      [Element.prototype, "replaceWith"],
+      [Element.prototype, "replaceChildren"],
       [Element.prototype, "insertAdjacentElement"]
     ].forEach(([proto, m]) => {
       try {
@@ -839,6 +901,36 @@
         }
       } catch {}
     });
+
+    // Khóa ngay iframe được chèn qua innerHTML / insertAdjacentHTML trước khi window.frames[i].open kịp chạy
+    try {
+      const ihDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+      if (ihDesc && ihDesc.set) {
+        Object.defineProperty(Element.prototype, "innerHTML", {
+          configurable: true,
+          get: ihDesc.get,
+          set: function (val) {
+            ihDesc.set.call(this, val);
+            if (typeof val === "string" && /<i?frame\b/i.test(val)) {
+              patchFrameTree(this);
+            }
+          }
+        });
+      }
+    } catch {}
+
+    try {
+      const origInsertAdjHTML = Element.prototype.insertAdjacentHTML;
+      if (typeof origInsertAdjHTML === "function") {
+        Element.prototype.insertAdjacentHTML = function (pos, html) {
+          const res = origInsertAdjHTML.apply(this, arguments);
+          if (typeof html === "string" && /<i?frame\b/i.test(html)) {
+            patchFrameTree(this.parentElement || this);
+          }
+          return res;
+        };
+      }
+    } catch {}
 
     try {
       const cwDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "contentWindow");
@@ -896,11 +988,12 @@
         configurable: true,
         writable: true,
         value: function () {
+          const isBlobOrData =
+            typeof this.href === "string" &&
+            (this.href.startsWith("blob:") || this.href.startsWith("data:"));
           const dl =
             this.hasAttribute("download") &&
-            allowMode !== "NONE" &&
-            Date.now() <= allowedUntil &&
-            (isSameSite(this.href) || matchesAllowedHost(this.href));
+            (isBlobOrData || (allowMode !== "NONE" && Date.now() <= allowedUntil));
           if (!bypassed && !dl && !isAllowed(this.href, opensNew(this))) {
             lastAttempt = Date.now();
             reportBlock();
@@ -913,7 +1006,8 @@
 
     const guardFormCall = (form, origFn, args) => {
       const actionUrl = form.getAttribute("action") || window.location.href;
-      if (!bypassed && !isSameSite(actionUrl) && !isWhitelistedUrl(actionUrl) && !isAllowed(actionUrl, opensNew(form))) {
+      const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
+      if (!bypassed && !safeDest && !isAllowed(actionUrl, opensNew(form))) {
         lastAttempt = Date.now();
         reportBlock();
         return;
@@ -945,10 +1039,11 @@
       }
     } catch {}
 
+    // Chỉ chặn document.write trên tài liệu chính, không làm hỏng iframe soạn thảo & thanh toán
     try {
       const origWrite = Document.prototype.write;
       Document.prototype.write = function () {
-        if (!bypassed && this.readyState === "complete") return;
+        if (!bypassed && this === document && this.readyState === "complete") return;
         return origWrite.apply(this, arguments);
       };
     } catch {}
@@ -979,12 +1074,16 @@
         if (n) scriptEl.setAttribute("nonce", n);
       }
       let code = `(${mainWorldBlocker.toString()})(${JSON.stringify(TOKEN)}, ${JSON.stringify(checkBypassed())}, ${JSON.stringify(curRoot)}, ${JSON.stringify(curHost)}, ${JSON.stringify(whitelist)});`;
-      if (window.trustedTypes && window.trustedTypes.createPolicy) {
+      if (window.trustedTypes) {
         try {
-          const policy = window.trustedTypes.createPolicy("gx-anti-redirect-policy", {
-            createScript: (s) => s
-          });
-          code = policy.createScript(code);
+          if (window.trustedTypes.createPolicy) {
+            const policy = window.trustedTypes.createPolicy("gx-anti-redirect-policy", {
+              createScript: (s) => s
+            });
+            code = policy.createScript(code);
+          } else if (window.trustedTypes.defaultPolicy && window.trustedTypes.defaultPolicy.createScript) {
+            code = window.trustedTypes.defaultPolicy.createScript(code);
+          }
         } catch {}
       }
       scriptEl.textContent = code;
