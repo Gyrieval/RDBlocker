@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      8.0.0
-// @description  Chặn chuyển hướng toàn diện, chống bẫy pseudo-element, khóa cổng redirect nội bộ và tương thích SPA trên Orion iOS
+// @version      9.0.0
+// @description  Tối ưu toàn diện: chặn click giả lập, khóa Window.prototype.open, chống bẫy history và quét DOM vi sai trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -30,7 +30,13 @@
     "zalo.me",
     "vnpay.vn",
     "momo.vn",
-    "zalopay.vn"
+    "zalopay.vn",
+    "onepay.vn",
+    "paypal.com",
+    "stripe.com",
+    "discord.com",
+    "x.com",
+    "twitter.com"
   ];
   const TWO_TLDS = new Set([
     "com.vn", "net.vn", "org.vn", "edu.vn", "gov.vn",
@@ -260,11 +266,11 @@
     true
   );
 
-  // Lớp chặn dự phòng ở Content Script khi trang khóa hoàn toàn inline <script>
+  // Lớp chặn dự phòng ở Content Script nếu trang dùng CSP khóa hoàn toàn inline <script>
   document.addEventListener(
     "click",
     (e) => {
-      if (mainAcked || checkBypassed() || !e.isTrusted) return;
+      if (mainAcked || checkBypassed()) return;
       const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
       for (let i = 0; i < path.length; i++) {
         const n = path[i];
@@ -277,6 +283,12 @@
             const h = u.hostname.toLowerCase().replace(/^www\./, "");
             const r = getRoot(h);
             const same = h === curHost || h.endsWith("." + curHost) || r === curRoot;
+            if (!e.isTrusted && !same) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+              addBlock();
+              return;
+            }
             const rect = n.getBoundingClientRect();
             const isOverlay = rect.width >= window.innerWidth * 0.65 && rect.height >= window.innerHeight * 0.65;
             if (!same && (isOverlay || rect.width === 0 || rect.height === 0)) {
@@ -376,7 +388,6 @@
       }
     };
 
-    // Phát hiện cổng chuyển tiếp quảng cáo nội bộ (/out?url=http..., /go/..., /redirect...)
     const isRedirectGateway = (u) => {
       try {
         const p = new URL(u, window.location.href);
@@ -397,7 +408,7 @@
     let touchOriginTarget = null;
     let touchOriginAnchor = null;
     let touchOriginTime = 0;
-    let lastInput = 0;
+    let lastGestureTime = 0;
     let lastAttempt = 0;
     let touchStartX = 0;
     let touchStartY = 0;
@@ -435,6 +446,9 @@
 
     const opensNew = (el) => {
       let t = ((el && el.getAttribute && el.getAttribute("target")) || "").trim();
+      if (!t && el && el.getAttribute) {
+        t = (el.getAttribute("formtarget") || "").trim();
+      }
       if (!t) {
         const b = document.querySelector("base[target]");
         if (b) t = (b.getAttribute("target") || "").trim();
@@ -463,7 +477,6 @@
       );
     };
 
-    // Kiểm tra cả lớp phủ thật lẫn lớp phủ giả ::before / ::after phủ kín màn hình
     function hasFullPseudoOverlay(el) {
       for (const pseudo of ["::before", "::after"]) {
         try {
@@ -539,19 +552,30 @@
       return false;
     }
 
-    window.addEventListener("input", (e) => { if (e.isTrusted) lastInput = Date.now(); }, true);
-    window.addEventListener("change", (e) => { if (e.isTrusted) lastInput = Date.now(); }, true);
+    window.addEventListener("keydown", (e) => {
+      if (e.isTrusted) lastGestureTime = Date.now();
+    }, true);
 
+    // Kiểm soát biểu mẫu HTML bao gồm cả thuộc tính formaction / formtarget trên nút submit
     document.addEventListener(
       "submit",
       (e) => {
         if (bypassed) return;
         const form = e.target;
         if (!form || form.tagName !== "FORM") return;
-        const actionUrl = form.getAttribute("action") || window.location.href;
+
+        const submitter = e.submitter || document.activeElement;
+        const actionUrl =
+          (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) ||
+          form.getAttribute("action") ||
+          window.location.href;
+        const formOpensNew =
+          opensNew(form) ||
+          Boolean(submitter && submitter.getAttribute && opensNew(submitter));
+
         const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
 
-        if (!e.isTrusted && !safeDest && !isAllowed(actionUrl, opensNew(form))) {
+        if (!e.isTrusted && !safeDest && !isAllowed(actionUrl, formOpensNew)) {
           e.preventDefault();
           e.stopImmediatePropagation();
           reportBlock();
@@ -593,9 +617,12 @@
             button = n;
             nativeBtn = true;
           } else if (i < 5) {
-            // Chỉ nhận diện phần tử có kích thước nút thật sự để tránh bẫy body { cursor: pointer }
             const r = n.getBoundingClientRect();
-            const compactControl = r.width > 0 && r.height > 0 && r.width < window.innerWidth * 0.5 && r.height < window.innerHeight * 0.35;
+            const compactControl =
+              r.width > 0 &&
+              r.height > 0 &&
+              r.width < window.innerWidth * 0.5 &&
+              r.height < window.innerHeight * 0.35;
             if (
               compactControl &&
               (window.getComputedStyle(n).cursor === "pointer" ||
@@ -675,7 +702,6 @@
 
       if (isNewTab) {
         if (expired) return false;
-        // Chỉ cho phép mở tab mới đúng tên miền của liên kết đã nhấn giữ hoặc trang trong Whitelist
         if (allowMode === "NEW_TAB") {
           return allowedUrl ? matchesAllowedHost(url) || isWhitelistedUrl(url) : isWhitelistedUrl(url);
         }
@@ -721,6 +747,7 @@
 
     const onInitialPress = (e, wantsNewTab) => {
       if (!e.isTrusted || bypassed) return;
+      lastGestureTime = Date.now();
       if (neutralizeInvisibleTrap(e.target)) {
         e.preventDefault();
         e.stopImmediatePropagation();
@@ -773,18 +800,24 @@
     );
 
     window.addEventListener("contextmenu", (e) => {
-      if (e.isTrusted && !bypassed) authorize(e, true, 12000);
+      if (e.isTrusted && !bypassed) {
+        lastGestureTime = Date.now();
+        authorize(e, true, 12000);
+      }
     }, true);
 
     document.addEventListener(
       "click",
       (e) => {
         if (bypassed) return;
-        if (neutralizeInvisibleTrap(e.target)) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          resetAuth();
-          return;
+        if (e.isTrusted) {
+          lastGestureTime = Date.now();
+          if (neutralizeInvisibleTrap(e.target)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            resetAuth();
+            return;
+          }
         }
 
         const { anchor } = findControls(e);
@@ -806,6 +839,16 @@
         const sameClean = isSameSite(href) && !gateway;
         const selfClone = normUrl(href) === normUrl(window.location.href);
         const newTab = opensNew(anchor);
+
+        // Chặn tuyệt đối các sự kiện click giả lập (!e.isTrusted) kích hoạt liên kết ngoài hoặc mở tab rác
+        if (!e.isTrusted) {
+          if (!isAllowed(href, newTab)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            reportBlock();
+          }
+          return;
+        }
 
         const wasInjectedMidTap =
           !sameClean &&
@@ -860,6 +903,17 @@
         } catch {
           w.open = fn;
         }
+        try {
+          const winProto = w.Window && w.Window.prototype;
+          if (winProto && winProto.open && !winProto.__gxProtoOpenLocked) {
+            Object.defineProperty(winProto, "open", {
+              configurable: false,
+              writable: false,
+              value: fn
+            });
+            Object.defineProperty(winProto, "__gxProtoOpenLocked", { value: true });
+          }
+        } catch {}
         Object.defineProperty(w, "__gxOpenLocked", { value: true });
       } catch {}
     }
@@ -877,6 +931,18 @@
         });
       }
     }
+
+    // Khóa lại contentWindow ngay khi iframe hoặc srcdoc hoàn tất nạp khung
+    window.addEventListener(
+      "load",
+      (e) => {
+        const t = e.target;
+        if (t && (t.tagName === "IFRAME" || t.tagName === "FRAME")) {
+          try { if (t.contentWindow) lockOpen(t.contentWindow); } catch {}
+        }
+      },
+      true
+    );
 
     [
       [Node.prototype, "appendChild"],
@@ -902,7 +968,6 @@
       } catch {}
     });
 
-    // Khóa ngay iframe được chèn qua innerHTML / insertAdjacentHTML trước khi window.frames[i].open kịp chạy
     try {
       const ihDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
       if (ihDesc && ihDesc.set) {
@@ -958,6 +1023,34 @@
           }
         });
       }
+    } catch {}
+
+    // Chặn bẫy nhồi lịch sử trình duyệt (history.pushState flood) nhằm vô hiệu hóa nút Quay lại
+    try {
+      let historySpamCount = 0;
+      let historySpamWindowStart = 0;
+      const origPushState = History.prototype.pushState;
+      History.prototype.pushState = function (state, title, url) {
+        if (!bypassed) {
+          const targetHref = url ? normUrl(String(url)) : normUrl(window.location.href);
+          const isSamePageTrap = targetHref === normUrl(window.location.href);
+          const noUserGesture = Date.now() - lastGestureTime > 1500;
+          if (isSamePageTrap && noUserGesture) {
+            const now = Date.now();
+            if (now - historySpamWindowStart > 2000) {
+              historySpamWindowStart = now;
+              historySpamCount = 1;
+            } else {
+              historySpamCount += 1;
+            }
+            if (historySpamCount >= 2) {
+              reportBlock();
+              return;
+            }
+          }
+        }
+        return origPushState.apply(this, arguments);
+      };
     } catch {}
 
     try {
@@ -1039,7 +1132,6 @@
       }
     } catch {}
 
-    // Chỉ chặn document.write trên tài liệu chính, không làm hỏng iframe soạn thảo & thanh toán
     try {
       const origWrite = Document.prototype.write;
       Document.prototype.write = function () {
@@ -1048,25 +1140,67 @@
       };
     } catch {}
 
-    const obs = new MutationObserver(() => {
-      if (bypassed) return;
-      document.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => m.remove());
-      document.querySelectorAll("base[target]").forEach((b) => {
-        const t = (b.getAttribute("target") || "").trim();
+    // Quét DOM vi sai: chỉ kiểm tra đúng các thẻ vừa được thêm mới hoặc sửa thuộc tính
+    const sanitizeNode = (node) => {
+      if (!node || node.nodeType !== 1) return;
+      const tag = node.tagName;
+      if (tag === "META" && /^refresh$/i.test(node.getAttribute("http-equiv") || "")) {
+        node.remove();
+        return;
+      }
+      if (tag === "BASE" && node.hasAttribute("target")) {
+        const t = (node.getAttribute("target") || "").trim();
         if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
-          b.removeAttribute("target");
+          node.removeAttribute("target");
         }
-      });
-      for (let i = 0; i < window.frames.length; i++) lockOpen(window.frames[i]);
+        return;
+      }
+      if (tag === "IFRAME" || tag === "FRAME") {
+        try { if (node.contentWindow) lockOpen(node.contentWindow); } catch {}
+        return;
+      }
+      if (node.firstElementChild) {
+        node.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => m.remove());
+        node.querySelectorAll("base[target]").forEach((b) => {
+          const t = (b.getAttribute("target") || "").trim();
+          if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
+            b.removeAttribute("target");
+          }
+        });
+        node.querySelectorAll("iframe, frame").forEach((f) => {
+          try { if (f.contentWindow) lockOpen(f.contentWindow); } catch {}
+        });
+      }
+    };
+
+    const obs = new MutationObserver((mutations) => {
+      if (bypassed) return;
+      for (let i = 0; i < mutations.length; i++) {
+        const m = mutations[i];
+        if (m.type === "childList") {
+          for (let j = 0; j < m.addedNodes.length; j++) {
+            sanitizeNode(m.addedNodes[j]);
+          }
+        } else if (m.type === "attributes") {
+          sanitizeNode(m.target);
+        }
+      }
     });
-    obs.observe(document, { childList: true, subtree: true });
+    obs.observe(document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["http-equiv", "target"]
+    });
   }
 
+  let injectAttempts = 0;
   function injectMainWorld() {
-    if (mainAcked) return;
+    if (mainAcked || injectAttempts >= 6) return;
     try {
       const targetParent = document.head || document.documentElement;
       if (!targetParent) return;
+      injectAttempts += 1;
       const scriptEl = document.createElement("script");
       const nonceEl = document.querySelector("script[nonce]");
       if (nonceEl) {
@@ -1095,12 +1229,23 @@
   injectMainWorld();
 
   const cspObserver = new MutationObserver(() => {
-    if (mainAcked) {
+    if (mainAcked || injectAttempts >= 6) {
       cspObserver.disconnect();
       return;
     }
-    injectMainWorld();
-    if (mainAcked) cspObserver.disconnect();
+    if (document.querySelector("script[nonce]")) {
+      injectMainWorld();
+      if (mainAcked || injectAttempts >= 6) cspObserver.disconnect();
+    }
   });
   cspObserver.observe(document, { childList: true, subtree: true });
+
+  window.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      if (!mainAcked) injectMainWorld();
+      cspObserver.disconnect();
+    },
+    { once: true }
+  );
 })();
