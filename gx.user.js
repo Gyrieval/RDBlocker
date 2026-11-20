@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      20.0.0
-// @description  Kiến trúc bảo vệ tối đa: vá race-condition touchstart/no-referrer, khóa replaceState, chống bẫy gradient và hoàn thiện fakeWin trên Orion iOS
+// @version      21.0.0
+// @description  Kiến trúc bảo vệ tối đa: chặn blob:text/html, khóa iframe data:text/html, quét DOM 0ms và chống auto-redirect hẹn giờ trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -162,16 +162,22 @@
         window.location.reload();
       };
 
+      const hasValidPrev = Boolean(prevUrl && /^https?:\/\//i.test(prevUrl));
       const backBtn = document.createElement("button");
-      backBtn.textContent = isIsolatedTab ? "Đóng tab" : "Về trang trước";
+      backBtn.textContent = isIsolatedTab && !hasValidPrev ? "Đóng tab" : "Về trang trước";
       backBtn.style.cssText =
         "background:#2563eb;color:#fff;border:none;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;";
       backBtn.onclick = () => {
-        if (isIsolatedTab) {
+        if (hasValidPrev) {
+          try {
+            const pu = new URL(prevUrl);
+            const ph = pu.hostname.toLowerCase().replace(/^www\./, "");
+            setVal("gx_legit_nav", { host: ph, root: getRoot(ph), anyExternal: false, time: Date.now() });
+          } catch {}
+          window.location.replace(prevUrl);
+        } else if (isIsolatedTab) {
           try { window.close(); } catch {}
           if (window.history.length > 1) window.history.back();
-        } else if (prevUrl) {
-          window.location.replace(prevUrl);
         } else {
           window.history.go(-2);
         }
@@ -200,7 +206,7 @@
     );
   };
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (bắt cả redirect ngay tại touchstart + no-referrer)
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -483,6 +489,7 @@
     window.__gxMainReady = true;
 
     const bypassed = Boolean(initialBypassed);
+    const pageLoadTime = Date.now();
     const nativePost = window.postMessage.bind(window);
     try {
       nativePost({ __gxToken: token, type: "GX_MAIN_ACK" }, "*");
@@ -661,6 +668,7 @@
     let lastAttempt = 0;
     let touchStartX = 0;
     let touchStartY = 0;
+    const blockedBlobUrls = new Set();
 
     const resetAuth = () => {
       lockedA = null;
@@ -1035,6 +1043,7 @@
       const expired = Date.now() > allowedUntil || allowMode === "NONE";
 
       if (lower.startsWith("blob:")) {
+        if (blockedBlobUrls.has(trimmed)) return false;
         return !isNewTab && !expired && (hasActiveUserGesture() || allowMode === "BUTTON" || allowMode === "DOMAIN");
       }
 
@@ -1224,9 +1233,15 @@
 
     window.addEventListener("beforeunload", (e) => {
       if (bypassed) return;
-      const hasUnsavedTyping = Date.now() - lastFormTypingTime < 30000;
-      const isUnauthorized = allowMode === "NONE" || Date.now() > allowedUntil;
-      if (hasUnsavedTyping && isUnauthorized) {
+      const now = Date.now();
+      const hasUnsavedTyping = now - lastFormTypingTime < 30000;
+      const isUnauthorized = allowMode === "NONE" || now > allowedUntil;
+      const isAutoRedirectNoGesture =
+        now - pageLoadTime > 800 &&
+        now - lastGestureTime > 1500 &&
+        isUnauthorized;
+      if ((hasUnsavedTyping && isUnauthorized) || isAutoRedirectNoGesture) {
+        reportBlock();
         e.preventDefault();
         e.returnValue = "";
       }
@@ -1561,6 +1576,22 @@
       }
 
       try {
+        if (w.URL && typeof w.URL.createObjectURL === "function") {
+          const origCreateObjUrl = w.URL.createObjectURL;
+          w.URL.createObjectURL = maskAsNative(function (obj) {
+            const res = origCreateObjUrl.apply(this, arguments);
+            try {
+              const t = (obj && obj.type ? String(obj.type) : "").toLowerCase();
+              if (t.includes("html") || t.includes("svg") || t.includes("xml")) {
+                blockedBlobUrls.add(res);
+              }
+            } catch {}
+            return res;
+          }, "createObjectURL");
+        }
+      } catch {}
+
+      try {
         const origOpen = w.open;
         const lockedOpen = maskAsNative(function (url, target, features) {
           const cleanTarget = String(target || "").trim();
@@ -1795,6 +1826,16 @@
       }
     }
 
+    const isDangerousIframeSrc = (rawUrl) => {
+      if (bypassed || hasActiveUserGesture()) return false;
+      const clean = sanitizeRawUrl(rawUrl).toLowerCase();
+      if (clean.startsWith("javascript:")) return true;
+      if (clean.startsWith("data:text/html") || clean.startsWith("data:application/xhtml")) {
+        return /<script|location|window\.open|http-equiv/i.test(clean);
+      }
+      return false;
+    };
+
     const injectBootIntoSrcdoc = (html) => {
       if (!bypassed && typeof html === "string" && /<script\b/i.test(html)) {
         const boot = "<script>try{parent.__gxPatchWin&&parent.__gxPatchWin(window)}catch(e){}</script>";
@@ -1804,6 +1845,24 @@
       }
       return html;
     };
+
+    try {
+      const srcDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "src");
+      if (srcDesc && srcDesc.set) {
+        Object.defineProperty(HTMLIFrameElement.prototype, "src", {
+          configurable: true,
+          get: srcDesc.get,
+          set: function (val) {
+            if (isDangerousIframeSrc(val)) {
+              reportBlock();
+              return;
+            }
+            srcDesc.set.call(this, val);
+            try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
+          }
+        });
+      }
+    } catch {}
 
     try {
       const sdDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "srcdoc");
@@ -1822,13 +1881,20 @@
     try {
       const origSetAttr = Element.prototype.setAttribute;
       Element.prototype.setAttribute = maskAsNative(function (name, value) {
-        if (!bypassed && this && this.tagName === "IFRAME" && /^srcdoc$/i.test(String(name).trim())) {
-          const res = origSetAttr.call(this, name, injectBootIntoSrcdoc(String(value)));
-          try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
-          return res;
+        const attrName = String(name).trim().toLowerCase();
+        if (!bypassed && this && this.tagName === "IFRAME") {
+          if (attrName === "srcdoc") {
+            const res = origSetAttr.call(this, name, injectBootIntoSrcdoc(String(value)));
+            try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
+            return res;
+          }
+          if (attrName === "src" && isDangerousIframeSrc(value)) {
+            reportBlock();
+            return;
+          }
         }
         const res = origSetAttr.apply(this, arguments);
-        if (!bypassed && this && this.tagName === "OBJECT" && /^data$/i.test(String(name).trim())) {
+        if (!bypassed && this && this.tagName === "OBJECT" && attrName === "data") {
           try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
         }
         return res;
@@ -2087,11 +2153,20 @@
       }
     };
 
+    // Quét dọn ngay các phần tử chuyển hướng có sẵn ở đầu luồng HTML
+    const sweepExistingNodes = () => {
+      if (!bypassed && document.documentElement) {
+        sanitizeNode(document.documentElement);
+      }
+    };
+    sweepExistingNodes();
+    window.addEventListener("DOMContentLoaded", sweepExistingNodes, { once: true });
+
     const observerConfig = {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["http-equiv", "target", "href", "srcdoc", "data"]
+      attributeFilter: ["http-equiv", "target", "href", "src", "srcdoc", "data"]
     };
 
     const obs = new MutationObserver((mutations) => {
