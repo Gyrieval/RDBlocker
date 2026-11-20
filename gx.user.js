@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      9.0.0
-// @description  Tối ưu toàn diện: chặn click giả lập, khóa Window.prototype.open, chống bẫy history và quét DOM vi sai trên Orion iOS
+// @version      10.0.0
+// @description  Kiến trúc bảo vệ toàn diện: khóa đa tầng iframe, đồng bộ ngăn xếp chạm, chặn Navigation API và chống bẫy data/base trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -89,7 +89,7 @@
     setVal("gx_blocked_count", blockedCount);
   };
 
-  function showLoopGuardBanner(targetDomain, prevUrl) {
+  function showLoopGuardBanner(targetDomain, prevUrl, isIsolatedTab) {
     const render = () => {
       if (!document.body || document.getElementById("__gx_loop_bar")) return;
       const bar = document.createElement("div");
@@ -101,7 +101,7 @@
         "box-shadow:0 10px 25px rgba(0,0,0,0.45);display:flex;flex-direction:column;gap:10px;";
 
       const msg = document.createElement("div");
-      msg.textContent = `GX Anti-Redirect đã ngắt chuyển hướng ép buộc tới ${targetDomain}`;
+      msg.textContent = `GX Anti-Redirect đã chặn chuyển hướng tới ${targetDomain}`;
 
       const actions = document.createElement("div");
       actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
@@ -116,11 +116,14 @@
       };
 
       const backBtn = document.createElement("button");
-      backBtn.textContent = "Về trang trước";
+      backBtn.textContent = isIsolatedTab ? "Đóng tab" : "Về trang trước";
       backBtn.style.cssText =
         "background:#2563eb;color:#fff;border:none;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;";
       backBtn.onclick = () => {
-        if (prevUrl) {
+        if (isIsolatedTab) {
+          try { window.close(); } catch {}
+          if (window.history.length > 1) window.history.back();
+        } else if (prevUrl) {
           window.location.replace(prevUrl);
         } else {
           window.history.go(-2);
@@ -178,10 +181,8 @@
         try { window.stop(); } catch {}
 
         if (window.history.length <= 2 || spawnedByOpener) {
-          try {
-            if (document.documentElement) document.documentElement.innerHTML = "";
-          } catch {}
           try { window.close(); } catch {}
+          showLoopGuardBanner(curRoot || curHost, document.referrer, true);
         } else {
           const sourceRoot = refRoot || (lastTouch && lastTouch.root) || "";
           const bounce = getVal("gx_bounce_guard", null);
@@ -192,7 +193,7 @@
             Date.now() - bounce.time < 6000;
 
           if (isRepeatedLoop) {
-            showLoopGuardBanner(curRoot || curHost, document.referrer);
+            showLoopGuardBanner(curRoot || curHost, document.referrer, false);
           } else {
             setVal("gx_bounce_guard", { from: sourceRoot, to: curRoot, time: Date.now() });
             try { window.history.back(); } catch {}
@@ -207,8 +208,8 @@
       setVal("gx_last_touch", { host: curHost, root: curRoot, time: Date.now() });
     }
   };
-  window.addEventListener("touchstart", recordTouchActivity, true);
-  window.addEventListener("pointerdown", recordTouchActivity, true);
+  window.addEventListener("touchend", recordTouchActivity, true);
+  window.addEventListener("pointerup", recordTouchActivity, true);
 
   if (window.top === window.self && typeof GM_registerMenuCommand === "function") {
     try {
@@ -380,7 +381,7 @@
     const isSameSite = (u) => {
       try {
         const p = new URL(u, window.location.href);
-        if (p.protocol === "blob:" || p.protocol === "data:") return true;
+        if (p.protocol === "blob:" || p.protocol === "data:") return false;
         const h = p.hostname.toLowerCase().replace(/^www\./, "");
         return h === hostName || h.endsWith("." + hostName) || getInnerRoot(h) === rootDomain;
       } catch {
@@ -408,6 +409,9 @@
     let touchOriginTarget = null;
     let touchOriginAnchor = null;
     let touchOriginTime = 0;
+    let touchMoved = false;
+    let trustedGestureDepth = 0;
+    let lastVerifiedTapTime = 0;
     let lastGestureTime = 0;
     let lastAttempt = 0;
     let touchStartX = 0;
@@ -420,6 +424,9 @@
       allowedUrl = null;
       allowedUntil = 0;
     };
+
+    const hasActiveUserGesture = () =>
+      trustedGestureDepth > 0 || Date.now() - lastVerifiedTapTime < 300;
 
     const getAnchorHref = (a) => {
       if (!a) return "";
@@ -552,47 +559,6 @@
       return false;
     }
 
-    window.addEventListener("keydown", (e) => {
-      if (e.isTrusted) lastGestureTime = Date.now();
-    }, true);
-
-    // Kiểm soát biểu mẫu HTML bao gồm cả thuộc tính formaction / formtarget trên nút submit
-    document.addEventListener(
-      "submit",
-      (e) => {
-        if (bypassed) return;
-        const form = e.target;
-        if (!form || form.tagName !== "FORM") return;
-
-        const submitter = e.submitter || document.activeElement;
-        const actionUrl =
-          (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) ||
-          form.getAttribute("action") ||
-          window.location.href;
-        const formOpensNew =
-          opensNew(form) ||
-          Boolean(submitter && submitter.getAttribute && opensNew(submitter));
-
-        const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
-
-        if (!e.isTrusted && !safeDest && !isAllowed(actionUrl, formOpensNew)) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          reportBlock();
-          return;
-        }
-        if (e.isTrusted) {
-          allowMode = "FORM_SUBMIT";
-          allowedUrl = actionUrl;
-          allowedUntil = Date.now() + 5000;
-          if (!isSameSite(actionUrl)) {
-            reportLegitExternalNav(actionUrl, false);
-          }
-        }
-      },
-      true
-    );
-
     function findControls(e) {
       const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
       let anchor = null;
@@ -671,7 +637,7 @@
         ) {
           allowMode = "BUTTON";
           allowedUrl = null;
-          allowedUntil = Date.now() + (nativeBtn ? 2800 : 1600);
+          allowedUntil = Date.now() + (nativeBtn ? 2500 : 1400);
           return true;
         }
       }
@@ -692,21 +658,34 @@
     function isAllowed(url, isNewTab = false) {
       if (bypassed) return true;
       if (!url) return false;
-      if (url.startsWith("blob:") || url.startsWith("data:")) return true;
-      if (/^javascript:/i.test(url.trim())) return false;
+      const trimmed = String(url).trim();
+      if (/^javascript:/i.test(trimmed)) return false;
 
-      const selfClone = normUrl(url) === normUrl(window.location.href);
-      const gateway = isRedirectGateway(url);
-      const sameClean = isSameSite(url) && !gateway;
       const expired = Date.now() > allowedUntil || allowMode === "NONE";
+
+      // Chỉ cho phép blob: / data: khi có thao tác hợp lệ đi kèm, chặn pop-up data:text/html tự phát
+      if (trimmed.startsWith("blob:") || trimmed.startsWith("data:")) {
+        return !expired && (hasActiveUserGesture() || allowMode === "BUTTON" || allowMode === "DOMAIN");
+      }
+
+      const selfClone = normUrl(trimmed) === normUrl(window.location.href);
+      const gateway = isRedirectGateway(trimmed);
+      const sameClean = isSameSite(trimmed) && !gateway;
 
       if (isNewTab) {
         if (expired) return false;
         if (allowMode === "NEW_TAB") {
-          return allowedUrl ? matchesAllowedHost(url) || isWhitelistedUrl(url) : isWhitelistedUrl(url);
+          return allowedUrl ? matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed) : isWhitelistedUrl(trimmed);
         }
-        if (allowMode === "EXT_LINK") return matchesAllowedHost(url) || isWhitelistedUrl(url);
-        if (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") return isWhitelistedUrl(url);
+        if (allowMode === "EXT_LINK") return matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed);
+        if (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") {
+          // Chỉ cho phép nút bấm mở tab mới nếu gọi đồng bộ ngay trong cú bấm thật của người dùng
+          if (hasActiveUserGesture() && !gateway) {
+            reportLegitExternalNav(trimmed, false);
+            return true;
+          }
+          return isWhitelistedUrl(trimmed);
+        }
         return false;
       }
 
@@ -714,9 +693,9 @@
       if (!selfClone && sameClean) return true;
 
       if (!expired) {
-        if (allowMode === "NEW_TAB") return allowedUrl ? matchesAllowedHost(url) || isWhitelistedUrl(url) : false;
-        if ((allowMode === "DOMAIN" || allowMode === "EXT_LINK") && matchesAllowedHost(url)) return true;
-        if ((allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") && (sameClean || isWhitelistedUrl(url))) {
+        if (allowMode === "NEW_TAB") return allowedUrl ? matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed) : false;
+        if ((allowMode === "DOMAIN" || allowMode === "EXT_LINK") && matchesAllowedHost(trimmed)) return true;
+        if ((allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") && (sameClean || isWhitelistedUrl(trimmed))) {
           return true;
         }
       }
@@ -745,43 +724,32 @@
       );
     }
 
-    const onInitialPress = (e, wantsNewTab) => {
-      if (!e.isTrusted || bypassed) return;
-      lastGestureTime = Date.now();
-      if (neutralizeInvisibleTrap(e.target)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        resetAuth();
-        return;
-      }
-      const { anchor } = findControls(e);
-      touchOriginTarget = e.target;
-      touchOriginAnchor = anchor;
-      touchOriginTime = Date.now();
-
-      if (!authorize(e, wantsNewTab, 3000)) {
-        resetAuth();
-      }
-    };
-
+    // touchstart chỉ ghi nhận điểm chạm gốc để chống tráo DOM, không mở khóa window.open()
     window.addEventListener(
       "touchstart",
       (e) => {
+        if (!e.isTrusted || bypassed) return;
+        touchMoved = false;
         if (e.touches && e.touches[0]) {
           touchStartX = e.touches[0].clientX;
           touchStartY = e.touches[0].clientY;
         }
-        onInitialPress(e, false);
-      },
-      true
-    );
-
-    window.addEventListener(
-      "pointerdown",
-      (e) => {
-        if (e.pointerType === "touch") return;
-        const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
-        onInitialPress(e, wantsNewTab);
+        if (neutralizeInvisibleTrap(e.target)) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          resetAuth();
+          return;
+        }
+        const { anchor } = findControls(e);
+        touchOriginTarget = e.target;
+        touchOriginAnchor = anchor;
+        touchOriginTime = Date.now();
+        if (anchor && !isPseudo(anchor)) {
+          lockedA = anchor;
+          lockedHref = getAnchorHref(anchor);
+        } else {
+          resetAuth();
+        }
       },
       true
     );
@@ -793,7 +761,72 @@
         if (e.touches && e.touches[0]) {
           const dx = Math.abs(e.touches[0].clientX - touchStartX);
           const dy = Math.abs(e.touches[0].clientY - touchStartY);
-          if (dx > 10 || dy > 10) resetAuth();
+          if (dx > 10 || dy > 10) {
+            touchMoved = true;
+            resetAuth();
+          }
+        }
+      },
+      true
+    );
+
+    const runVerifiedPress = (e, wantsNewTab) => {
+      if (!e.isTrusted || bypassed) return;
+      lastGestureTime = Date.now();
+      if (neutralizeInvisibleTrap(e.target)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        resetAuth();
+        return;
+      }
+      if (authorize(e, wantsNewTab, 2800)) {
+        lastVerifiedTapTime = Date.now();
+      } else {
+        resetAuth();
+      }
+    };
+
+    window.addEventListener(
+      "touchend",
+      (e) => {
+        if (!e.isTrusted || bypassed || touchMoved) return;
+        trustedGestureDepth += 1;
+        try {
+          runVerifiedPress(e, false);
+        } finally {
+          setTimeout(() => { trustedGestureDepth = Math.max(0, trustedGestureDepth - 1); }, 0);
+        }
+      },
+      true
+    );
+
+    window.addEventListener(
+      "pointerdown",
+      (e) => {
+        if (!e.isTrusted || bypassed || e.pointerType === "touch") return;
+        const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
+        const { anchor } = findControls(e);
+        touchOriginTarget = e.target;
+        touchOriginAnchor = anchor;
+        touchOriginTime = Date.now();
+        runVerifiedPress(e, wantsNewTab);
+      },
+      true
+    );
+
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        if (!e.isTrusted || bypassed) return;
+        lastGestureTime = Date.now();
+        if (e.key === "Enter" || e.key === " ") {
+          const wantsNewTab = e.ctrlKey || e.metaKey || e.shiftKey;
+          trustedGestureDepth += 1;
+          try {
+            runVerifiedPress(e, wantsNewTab);
+          } finally {
+            setTimeout(() => { trustedGestureDepth = Math.max(0, trustedGestureDepth - 1); }, 0);
+          }
         }
       },
       true
@@ -806,139 +839,279 @@
       }
     }, true);
 
-    document.addEventListener(
-      "click",
-      (e) => {
-        if (bypassed) return;
-        if (e.isTrusted) {
-          lastGestureTime = Date.now();
-          if (neutralizeInvisibleTrap(e.target)) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            resetAuth();
-            return;
-          }
-        }
-
-        const { anchor } = findControls(e);
-        if (!anchor || isPseudo(anchor)) {
-          if (e.isTrusted && allowMode === "NONE") {
-            const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
-            authorize(e, wantsNewTab, 2500);
-          }
-          return;
-        }
-
-        let href = getAnchorHref(anchor);
-        if (lockedA === anchor && lockedHref && href !== lockedHref) {
-          try { anchor.setAttribute("href", lockedHref); } catch {}
-          href = lockedHref;
-        }
-
-        const gateway = isRedirectGateway(href);
-        const sameClean = isSameSite(href) && !gateway;
-        const selfClone = normUrl(href) === normUrl(window.location.href);
-        const newTab = opensNew(anchor);
-
-        // Chặn tuyệt đối các sự kiện click giả lập (!e.isTrusted) kích hoạt liên kết ngoài hoặc mở tab rác
-        if (!e.isTrusted) {
-          if (!isAllowed(href, newTab)) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            reportBlock();
-          }
-          return;
-        }
-
-        const wasInjectedMidTap =
-          !sameClean &&
-          Date.now() - touchOriginTime < 1200 &&
-          touchOriginAnchor !== anchor &&
-          (!touchOriginTarget || !anchor.contains(touchOriginTarget));
-
-        if (wasInjectedMidTap) {
+    function handleDocumentClick(e) {
+      if (bypassed) return;
+      if (e.isTrusted) {
+        lastGestureTime = Date.now();
+        if (neutralizeInvisibleTrap(e.target)) {
           e.preventDefault();
           e.stopImmediatePropagation();
           resetAuth();
-          reportBlock();
           return;
         }
+      }
 
-        if (selfClone && newTab) {
-          e.preventDefault();
-          lastAttempt = Date.now();
-          reportBlock();
-          return;
-        }
-
-        if (sameClean) {
-          if (newTab && allowMode !== "NEW_TAB") {
-            try { anchor.setAttribute("target", "_self"); } catch {}
+      const { anchor } = findControls(e);
+      if (!anchor || isPseudo(anchor)) {
+        if (e.isTrusted) {
+          const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
+          if (authorize(e, wantsNewTab, 2500)) {
+            lastVerifiedTapTime = Date.now();
           }
-          return;
         }
+        return;
+      }
 
-        if (!isRealExtLink(anchor)) {
+      let href = getAnchorHref(anchor);
+      if (lockedA === anchor && lockedHref && href !== lockedHref) {
+        try { anchor.setAttribute("href", lockedHref); } catch {}
+        href = lockedHref;
+      }
+
+      const gateway = isRedirectGateway(href);
+      const sameClean = isSameSite(href) && !gateway;
+      const selfClone = normUrl(href) === normUrl(window.location.href);
+      const newTab = opensNew(anchor);
+
+      if (!e.isTrusted) {
+        if (!isAllowed(href, newTab)) {
           e.preventDefault();
           e.stopImmediatePropagation();
           reportBlock();
-          return;
         }
+        return;
+      }
 
-        reportLegitExternalNav(href, gateway);
-      },
-      true
-    );
+      const wasInjectedMidTap =
+        !sameClean &&
+        Date.now() - touchOriginTime < 1200 &&
+        touchOriginAnchor !== anchor &&
+        (!touchOriginTarget || !anchor.contains(touchOriginTarget));
 
-    function lockOpen(w) {
-      if (!w || w.__gxOpenLocked) return;
+      if (wasInjectedMidTap) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        resetAuth();
+        reportBlock();
+        return;
+      }
+
+      if (selfClone && newTab) {
+        e.preventDefault();
+        lastAttempt = Date.now();
+        reportBlock();
+        return;
+      }
+
+      if (sameClean) {
+        if (newTab && allowMode !== "NEW_TAB") {
+          try { anchor.setAttribute("target", "_self"); } catch {}
+        }
+        return;
+      }
+
+      if (!isRealExtLink(anchor)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        reportBlock();
+        return;
+      }
+
+      reportLegitExternalNav(href, gateway);
+    }
+
+    function handleDocumentSubmit(e) {
+      if (bypassed) return;
+      const form = e.target;
+      if (!form || form.tagName !== "FORM") return;
+
+      const submitter = e.submitter || document.activeElement;
+      const actionUrl =
+        (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) ||
+        form.getAttribute("action") ||
+        window.location.href;
+      const formOpensNew =
+        opensNew(form) ||
+        Boolean(submitter && submitter.getAttribute && opensNew(submitter));
+
+      const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
+
+      if (!e.isTrusted && !safeDest && !isAllowed(actionUrl, formOpensNew)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        reportBlock();
+        return;
+      }
+      if (e.isTrusted) {
+        allowMode = "FORM_SUBMIT";
+        allowedUrl = actionUrl;
+        allowedUntil = Date.now() + 5000;
+        lastVerifiedTapTime = Date.now();
+        if (!isSameSite(actionUrl)) {
+          reportLegitExternalNav(actionUrl, false);
+        }
+      }
+    }
+
+    const guardFormCall = (form, origFn, args) => {
+      const actionUrl = form.getAttribute("action") || window.location.href;
+      const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
+      if (!bypassed && !safeDest && !isAllowed(actionUrl, opensNew(form))) {
+        lastAttempt = Date.now();
+        reportBlock();
+        return;
+      }
+      return origFn.apply(form, args);
+    };
+
+    // Khóa đồng bộ cả trang chính lẫn mọi khung iframe cùng nguồn
+    function patchWindowEnvironment(w) {
+      if (!w || w.__gxEnvLocked) return;
       try {
-        const orig = w.open;
-        const fn = function (url, target) {
+        Object.defineProperty(w, "__gxEnvLocked", { value: true });
+      } catch {
+        return;
+      }
+
+      try {
+        const origOpen = w.open;
+        const lockedOpen = function (url, target) {
           const isNew = !target || (target !== "_self" && target !== "_parent" && target !== "_top");
-          return isAllowed(url, isNew) ? orig.apply(this, arguments) : fakeWin(url);
+          return isAllowed(url, isNew) ? origOpen.apply(this, arguments) : fakeWin(url);
         };
         try {
-          Object.defineProperty(w, "open", { configurable: false, writable: false, value: fn });
+          Object.defineProperty(w, "open", { configurable: false, writable: false, value: lockedOpen });
         } catch {
-          w.open = fn;
+          w.open = lockedOpen;
         }
-        try {
-          const winProto = w.Window && w.Window.prototype;
-          if (winProto && winProto.open && !winProto.__gxProtoOpenLocked) {
-            Object.defineProperty(winProto, "open", {
-              configurable: false,
-              writable: false,
-              value: fn
+        const winProto = w.Window && w.Window.prototype;
+        if (winProto && winProto.open && !winProto.__gxProtoOpenLocked) {
+          Object.defineProperty(winProto, "open", { configurable: false, writable: false, value: lockedOpen });
+          Object.defineProperty(winProto, "__gxProtoOpenLocked", { value: true });
+        }
+      } catch {}
+
+      try {
+        const locProto = w.Location && w.Location.prototype;
+        if (locProto) {
+          const origAssign = locProto.assign;
+          locProto.assign = function (url) {
+            if (!bypassed && !isAllowed(String(url), false)) {
+              reportBlock();
+              return;
+            }
+            return origAssign.apply(this, arguments);
+          };
+          const origReplace = locProto.replace;
+          locProto.replace = function (url) {
+            if (!bypassed && !isAllowed(String(url), false)) {
+              reportBlock();
+              return;
+            }
+            return origReplace.apply(this, arguments);
+          };
+        }
+      } catch {}
+
+      try {
+        const aProto = w.HTMLAnchorElement && w.HTMLAnchorElement.prototype;
+        if (aProto && aProto.click) {
+          const origAClick = aProto.click;
+          Object.defineProperty(aProto, "click", {
+            configurable: true,
+            writable: true,
+            value: function () {
+              const hrefStr = typeof this.href === "string" ? this.href : "";
+              const isBlobOrData = hrefStr.startsWith("blob:") || hrefStr.startsWith("data:");
+              const dl =
+                this.hasAttribute("download") &&
+                (isBlobOrData || (allowMode !== "NONE" && Date.now() <= allowedUntil));
+              if (!bypassed && !dl && !isAllowed(hrefStr, opensNew(this))) {
+                lastAttempt = Date.now();
+                reportBlock();
+                return;
+              }
+              return origAClick.apply(this, arguments);
+            }
+          });
+        }
+      } catch {}
+
+      try {
+        const fProto = w.HTMLFormElement && w.HTMLFormElement.prototype;
+        if (fProto) {
+          const origFSubmit = fProto.submit;
+          Object.defineProperty(fProto, "submit", {
+            configurable: true,
+            writable: true,
+            value: function () {
+              return guardFormCall(this, origFSubmit, arguments);
+            }
+          });
+          if (typeof fProto.requestSubmit === "function") {
+            const origFReqSubmit = fProto.requestSubmit;
+            Object.defineProperty(fProto, "requestSubmit", {
+              configurable: true,
+              writable: true,
+              value: function () {
+                return guardFormCall(this, origFReqSubmit, arguments);
+              }
             });
-            Object.defineProperty(winProto, "__gxProtoOpenLocked", { value: true });
           }
-        } catch {}
-        Object.defineProperty(w, "__gxOpenLocked", { value: true });
+        }
+      } catch {}
+
+      try {
+        if (w.navigation && typeof w.navigation.addEventListener === "function") {
+          w.navigation.addEventListener("navigate", (e) => {
+            if (bypassed || e.navigationType === "reload" || e.hashChange || e.downloadRequest) return;
+            const dest = e.destination && e.destination.url;
+            if (!dest) return;
+            if (!isAllowed(dest, false) && e.cancelable) {
+              e.preventDefault();
+              reportBlock();
+            }
+          });
+        }
+      } catch {}
+
+      try {
+        if (w.document) {
+          w.document.addEventListener("click", (e) => {
+            if (e.isTrusted) trustedGestureDepth += 1;
+            try {
+              handleDocumentClick(e);
+            } finally {
+              if (e.isTrusted) {
+                setTimeout(() => { trustedGestureDepth = Math.max(0, trustedGestureDepth - 1); }, 0);
+              }
+            }
+          }, true);
+          w.document.addEventListener("submit", handleDocumentSubmit, true);
+        }
       } catch {}
     }
 
-    lockOpen(window);
+    patchWindowEnvironment(window);
 
     function patchFrameTree(node) {
       if (!node || node.nodeType !== 1) return;
       if (node.tagName === "IFRAME" || node.tagName === "FRAME") {
-        try { if (node.contentWindow) lockOpen(node.contentWindow); } catch {}
+        try { if (node.contentWindow) patchWindowEnvironment(node.contentWindow); } catch {}
       }
       if (node.querySelectorAll) {
         node.querySelectorAll("iframe, frame").forEach((f) => {
-          try { if (f.contentWindow) lockOpen(f.contentWindow); } catch {}
+          try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
         });
       }
     }
 
-    // Khóa lại contentWindow ngay khi iframe hoặc srcdoc hoàn tất nạp khung
     window.addEventListener(
       "load",
       (e) => {
         const t = e.target;
         if (t && (t.tagName === "IFRAME" || t.tagName === "FRAME")) {
-          try { if (t.contentWindow) lockOpen(t.contentWindow); } catch {}
+          try { if (t.contentWindow) patchWindowEnvironment(t.contentWindow); } catch {}
         }
       },
       true
@@ -969,42 +1142,13 @@
     });
 
     try {
-      const ihDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
-      if (ihDesc && ihDesc.set) {
-        Object.defineProperty(Element.prototype, "innerHTML", {
-          configurable: true,
-          get: ihDesc.get,
-          set: function (val) {
-            ihDesc.set.call(this, val);
-            if (typeof val === "string" && /<i?frame\b/i.test(val)) {
-              patchFrameTree(this);
-            }
-          }
-        });
-      }
-    } catch {}
-
-    try {
-      const origInsertAdjHTML = Element.prototype.insertAdjacentHTML;
-      if (typeof origInsertAdjHTML === "function") {
-        Element.prototype.insertAdjacentHTML = function (pos, html) {
-          const res = origInsertAdjHTML.apply(this, arguments);
-          if (typeof html === "string" && /<i?frame\b/i.test(html)) {
-            patchFrameTree(this.parentElement || this);
-          }
-          return res;
-        };
-      }
-    } catch {}
-
-    try {
       const cwDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "contentWindow");
       if (cwDesc && cwDesc.get) {
         Object.defineProperty(HTMLIFrameElement.prototype, "contentWindow", {
           configurable: true,
           get: function () {
             const cw = cwDesc.get.call(this);
-            try { if (cw) lockOpen(cw); } catch {}
+            try { if (cw) patchWindowEnvironment(cw); } catch {}
             return cw;
           }
         });
@@ -1018,14 +1162,13 @@
           configurable: true,
           get: function () {
             const cd = cdDesc.get.call(this);
-            try { if (cd && cd.defaultView) lockOpen(cd.defaultView); } catch {}
+            try { if (cd && cd.defaultView) patchWindowEnvironment(cd.defaultView); } catch {}
             return cd;
           }
         });
       }
     } catch {}
 
-    // Chặn bẫy nhồi lịch sử trình duyệt (history.pushState flood) nhằm vô hiệu hóa nút Quay lại
     try {
       let historySpamCount = 0;
       let historySpamWindowStart = 0;
@@ -1054,85 +1197,6 @@
     } catch {}
 
     try {
-      const origAssign = Location.prototype.assign;
-      Location.prototype.assign = function (url) {
-        if (!bypassed && !isAllowed(String(url), false)) {
-          reportBlock();
-          return;
-        }
-        return origAssign.apply(this, arguments);
-      };
-    } catch {}
-
-    try {
-      const origReplace = Location.prototype.replace;
-      Location.prototype.replace = function (url) {
-        if (!bypassed && !isAllowed(String(url), false)) {
-          reportBlock();
-          return;
-        }
-        return origReplace.apply(this, arguments);
-      };
-    } catch {}
-
-    try {
-      const origAClick = HTMLAnchorElement.prototype.click;
-      Object.defineProperty(HTMLAnchorElement.prototype, "click", {
-        configurable: true,
-        writable: true,
-        value: function () {
-          const isBlobOrData =
-            typeof this.href === "string" &&
-            (this.href.startsWith("blob:") || this.href.startsWith("data:"));
-          const dl =
-            this.hasAttribute("download") &&
-            (isBlobOrData || (allowMode !== "NONE" && Date.now() <= allowedUntil));
-          if (!bypassed && !dl && !isAllowed(this.href, opensNew(this))) {
-            lastAttempt = Date.now();
-            reportBlock();
-            return;
-          }
-          return origAClick.apply(this, arguments);
-        }
-      });
-    } catch {}
-
-    const guardFormCall = (form, origFn, args) => {
-      const actionUrl = form.getAttribute("action") || window.location.href;
-      const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
-      if (!bypassed && !safeDest && !isAllowed(actionUrl, opensNew(form))) {
-        lastAttempt = Date.now();
-        reportBlock();
-        return;
-      }
-      return origFn.apply(form, args);
-    };
-
-    try {
-      const origFSubmit = HTMLFormElement.prototype.submit;
-      Object.defineProperty(HTMLFormElement.prototype, "submit", {
-        configurable: true,
-        writable: true,
-        value: function () {
-          return guardFormCall(this, origFSubmit, arguments);
-        }
-      });
-    } catch {}
-
-    try {
-      const origFReqSubmit = HTMLFormElement.prototype.requestSubmit;
-      if (typeof origFReqSubmit === "function") {
-        Object.defineProperty(HTMLFormElement.prototype, "requestSubmit", {
-          configurable: true,
-          writable: true,
-          value: function () {
-            return guardFormCall(this, origFReqSubmit, arguments);
-          }
-        });
-      }
-    } catch {}
-
-    try {
       const origWrite = Document.prototype.write;
       Document.prototype.write = function () {
         if (!bypassed && this === document && this.readyState === "complete") return;
@@ -1140,7 +1204,22 @@
       };
     } catch {}
 
-    // Quét DOM vi sai: chỉ kiểm tra đúng các thẻ vừa được thêm mới hoặc sửa thuộc tính
+    const sanitizeBaseTag = (b) => {
+      const t = (b.getAttribute("target") || "").trim();
+      if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
+        b.removeAttribute("target");
+      }
+      const rawBaseHref = (b.getAttribute("href") || "").trim();
+      if (rawBaseHref) {
+        try {
+          const parsedBase = new URL(rawBaseHref, window.location.href);
+          if (!isSameSite(parsedBase.href)) {
+            b.remove();
+          }
+        } catch {}
+      }
+    };
+
     const sanitizeNode = (node) => {
       if (!node || node.nodeType !== 1) return;
       const tag = node.tagName;
@@ -1148,27 +1227,19 @@
         node.remove();
         return;
       }
-      if (tag === "BASE" && node.hasAttribute("target")) {
-        const t = (node.getAttribute("target") || "").trim();
-        if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
-          node.removeAttribute("target");
-        }
+      if (tag === "BASE") {
+        sanitizeBaseTag(node);
         return;
       }
       if (tag === "IFRAME" || tag === "FRAME") {
-        try { if (node.contentWindow) lockOpen(node.contentWindow); } catch {}
+        try { if (node.contentWindow) patchWindowEnvironment(node.contentWindow); } catch {}
         return;
       }
       if (node.firstElementChild) {
         node.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => m.remove());
-        node.querySelectorAll("base[target]").forEach((b) => {
-          const t = (b.getAttribute("target") || "").trim();
-          if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
-            b.removeAttribute("target");
-          }
-        });
+        node.querySelectorAll("base").forEach(sanitizeBaseTag);
         node.querySelectorAll("iframe, frame").forEach((f) => {
-          try { if (f.contentWindow) lockOpen(f.contentWindow); } catch {}
+          try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
         });
       }
     };
@@ -1190,7 +1261,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["http-equiv", "target"]
+      attributeFilter: ["http-equiv", "target", "href"]
     });
   }
 
