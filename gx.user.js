@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      23.0.0
-// @description  Phiên bản tối ưu toàn diện: chặn redirect, pop-under, bẫy tàng hình, iframe sandbox/write và tối ưu hiệu năng trên Orion iOS
+// @version      24.0.0
+// @description  Vá lỗi đẩy về trang tìm kiếm, hỗ trợ đa công cụ tìm kiếm, chặn redirect/pop-under và bẫy tàng hình trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -29,6 +29,18 @@
   const TOKEN = "__gx_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
   const DEFAULT_WL = [
     "google.com",
+    "bing.com",
+    "duckduckgo.com",
+    "coccoc.com",
+    "yahoo.com",
+    "search.brave.com",
+    "yandex.com",
+    "yandex.ru",
+    "ecosia.org",
+    "startpage.com",
+    "qwant.com",
+    "naver.com",
+    "baidu.com",
     "youtube.com",
     "facebook.com",
     "github.com",
@@ -74,12 +86,19 @@
   if (!Array.isArray(whitelist)) {
     whitelist = [...DEFAULT_WL];
     setVal("gx_whitelist", whitelist);
-  } else if (whitelist.includes("apple.com")) {
-    whitelist = whitelist.filter((d) => d !== "apple.com");
-    for (const sub of ["icloud.com", "idmsa.apple.com", "support.apple.com"]) {
-      if (!whitelist.includes(sub)) whitelist.push(sub);
+  } else {
+    let changed = false;
+    if (whitelist.includes("apple.com")) {
+      whitelist = whitelist.filter((d) => d !== "apple.com");
+      changed = true;
     }
-    setVal("gx_whitelist", whitelist);
+    for (const d of DEFAULT_WL) {
+      if (!whitelist.includes(d)) {
+        whitelist.push(d);
+        changed = true;
+      }
+    }
+    if (changed) setVal("gx_whitelist", whitelist);
   }
   let blockedCount = Number(getVal("gx_blocked_count", 0)) || 0;
 
@@ -93,7 +112,13 @@
       : p.slice(-2).join(".");
   }
 
+  const isSearchEngineHost = (h) =>
+    /^([a-z0-9-]+\.)*(google\.[a-z.]{2,6}|bing\.com|duckduckgo\.com|coccoc\.com|yahoo\.com|search\.brave\.com|yandex\.(?:com|ru)|ecosia\.org|startpage\.com|qwant\.com|naver\.com|baidu\.com|sogou\.com|ask\.com)$/i.test(
+      h || ""
+    );
+
   const isWhitelistedHost = (host, root) =>
+    isSearchEngineHost(host) ||
     whitelist.some((d) => host === d || host.endsWith("." + d) || root === d);
 
   const isKnownOpenRedirectUrl = (u) => {
@@ -201,12 +226,12 @@
     const legitNav = getVal("gx_legit_nav", null);
     return Boolean(
       legitNav &&
-        Date.now() - legitNav.time < 10000 &&
+        Date.now() - legitNav.time < 8000 &&
         (legitNav.anyExternal || legitNav.root === curRoot || legitNav.host === curHost)
     );
   };
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (thay thế background.js)
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -227,13 +252,14 @@
         (!refIsWhitelisted ||
           (refIsOpenRedirect &&
             Boolean(lastTouch) &&
+            Date.now() - lastTouch.time < 3000 &&
             Boolean(lastTouch.root) &&
             !isWhitelistedHost(lastTouch.host, lastTouch.root)));
       const spawnedByOpener = Boolean(window.opener);
 
       const spawnedRightAfterTouch =
         Boolean(lastTouch) &&
-        Date.now() - lastTouch.time < 5000 &&
+        Date.now() - lastTouch.time < 2500 &&
         Boolean(lastTouch.root) &&
         lastTouch.root !== curRoot &&
         !isWhitelistedHost(lastTouch.host, lastTouch.root);
@@ -287,6 +313,27 @@
   window.addEventListener("pointerdown", recordTouchActivity, true);
   window.addEventListener("touchend", recordTouchActivity, true);
   window.addEventListener("pointerup", recordTouchActivity, true);
+
+  // Ghi nhận ý định điều hướng khi người dùng bấm kết quả trên trang tìm kiếm / trang Whitelist
+  window.addEventListener(
+    "click",
+    (e) => {
+      if (!enabled || !e.isTrusted || !checkBypassed()) return;
+      const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
+      for (let i = 0; i < path.length; i++) {
+        const n = path[i];
+        if (!n || n.nodeType !== 1 || n === document.body || n === document.documentElement) break;
+        if (
+          (n.localName === "a" || n.localName === "area") &&
+          n.hasAttribute("href")
+        ) {
+          setVal("gx_legit_nav", { host: curHost, root: curRoot, anyExternal: true, time: Date.now() });
+          return;
+        }
+      }
+    },
+    true
+  );
 
   if (window.top === window.self && typeof GM_registerMenuCommand === "function") {
     try {
@@ -527,7 +574,6 @@
     window.__gxMainReady = true;
 
     const bypassed = Boolean(initialBypassed);
-    const pageLoadTime = Date.now();
     const nativePost = window.postMessage.bind(window);
     try {
       nativePost({ __gxToken: token, type: "GX_MAIN_ACK" }, "*");
@@ -1056,6 +1102,7 @@
           allowMode = "BUTTON";
           allowedUrl = null;
           allowedUntil = Date.now() + (nativeBtn ? 2500 : 1400);
+          reportLegitExternalNav(window.location.href, true);
           return true;
         }
       }
@@ -1536,9 +1583,7 @@
         allowedUrl = actionUrl;
         allowedUntil = Date.now() + 5000;
         lastVerifiedTapTime = Date.now();
-        if (!isSameSite(actionUrl)) {
-          reportLegitExternalNav(actionUrl, false);
-        }
+        reportLegitExternalNav(actionUrl, true);
       }
     }
 
