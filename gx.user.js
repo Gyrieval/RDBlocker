@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      18.0.0
-// @description  Kiến trúc bảo vệ tối đa: khóa object/setAttribute srcdoc, chặn mượn danh redirect Google/FB, tối ưu SPA di động trên Orion iOS
+// @version      19.0.0
+// @description  Kiến trúc bảo vệ toàn diện: khóa dispatchEvent trên detached node, lọc ký tự điều khiển URL, chống trễ đồng bộ tab iOS và hỗ trợ OAuth trên Orion
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -191,6 +191,15 @@
     }
   }
 
+  const isMatchedLegitNav = () => {
+    const legitNav = getVal("gx_legit_nav", null);
+    return Boolean(
+      legitNav &&
+        Date.now() - legitNav.time < 10000 &&
+        (legitNav.anyExternal || legitNav.root === curRoot || legitNav.host === curHost)
+    );
+  };
+
   // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
@@ -216,36 +225,39 @@
         lastTouch.root !== curRoot &&
         !isWhitelistedHost(lastTouch.host, lastTouch.root);
 
-      const legitNav = getVal("gx_legit_nav", null);
-      const isUserIntendedNav =
-        legitNav &&
-        Date.now() - legitNav.time < 10000 &&
-        (legitNav.anyExternal || legitNav.root === curRoot || legitNav.host === curHost);
-
-      if ((fromExternalSite || spawnedByOpener || spawnedRightAfterTouch) && !isUserIntendedNav) {
-        addBlock();
+      if ((fromExternalSite || spawnedByOpener || spawnedRightAfterTouch) && !isMatchedLegitNav()) {
         try { window.stop(); } catch {}
         silencePageMedia();
 
-        if (window.history.length <= 2 || spawnedByOpener) {
-          try { window.close(); } catch {}
-          showLoopGuardBanner(curRoot || curHost, document.referrer, true);
-        } else {
-          const sourceRoot = refRoot || (lastTouch && lastTouch.root) || "";
-          const bounce = getVal("gx_bounce_guard", null);
-          const isRepeatedLoop =
-            bounce &&
-            bounce.from === sourceRoot &&
-            bounce.to === curRoot &&
-            Date.now() - bounce.time < 6000;
-
-          if (isRepeatedLoop) {
-            showLoopGuardBanner(curRoot || curHost, document.referrer, false);
-          } else {
-            setVal("gx_bounce_guard", { from: sourceRoot, to: curRoot, time: Date.now() });
-            try { window.history.back(); } catch {}
+        const finalizeBlockNavigation = () => {
+          if (isMatchedLegitNav()) {
+            window.location.reload();
+            return;
           }
-        }
+          addBlock();
+          if (window.history.length <= 2 || spawnedByOpener) {
+            try { window.close(); } catch {}
+            showLoopGuardBanner(curRoot || curHost, document.referrer, true);
+          } else {
+            const sourceRoot = refRoot || (lastTouch && lastTouch.root) || "";
+            const bounce = getVal("gx_bounce_guard", null);
+            const isRepeatedLoop =
+              bounce &&
+              bounce.from === sourceRoot &&
+              bounce.to === curRoot &&
+              Date.now() - bounce.time < 6000;
+
+            if (isRepeatedLoop) {
+              showLoopGuardBanner(curRoot || curHost, document.referrer, false);
+            } else {
+              setVal("gx_bounce_guard", { from: sourceRoot, to: curRoot, time: Date.now() });
+              try { window.history.back(); } catch {}
+            }
+          }
+        };
+
+        // Đợi 60ms để đồng bộ trạng thái GM_setValue giữa 2 tab trên iOS trước khi đóng tab
+        setTimeout(finalizeBlockNavigation, 60);
       }
     } catch {}
   }
@@ -370,7 +382,7 @@
         const n = path[i];
         if (!n || n.nodeType !== 1) continue;
         if ((n.localName === "a" || n.localName === "area") && n.hasAttribute("href")) {
-          const rawHref = (n.getAttribute("href") || "").trim();
+          const rawHref = (n.getAttribute("href") || "").replace(/[\x00-\x1f\x7f]/g, "").trim();
           if (!rawHref || rawHref.startsWith("#") || rawHref.toLowerCase().startsWith("javascript:")) return;
           try {
             const u = new URL(rawHref, window.location.href);
@@ -448,7 +460,7 @@
       for (let j = 0; j < m.addedNodes.length; j++) {
         const node = m.addedNodes[j];
         if (!node || node.nodeType !== 1) continue;
-        if (node.tagName === "META" && /^refresh$/i.test(node.getAttribute("http-equiv") || "")) {
+        if (node.tagName === "META" && /^refresh$/i.test((node.getAttribute("http-equiv") || "").trim())) {
           node.remove();
         } else if (node.tagName === "BASE") {
           const t = (node.getAttribute("target") || "").trim();
@@ -492,6 +504,9 @@
         : p.slice(-2).join(".");
     };
 
+    const sanitizeRawUrl = (raw) =>
+      String(raw || "").replace(/[\x00-\x1f\x7f]/g, "").trim();
+
     const isOpenRedirectOnWhitelisted = (p) => {
       const h = p.hostname.toLowerCase().replace(/^www\./, "");
       if ((h === "google.com" || h.endsWith(".google.com")) && (/^\/(url|amp\/s)\b/i.test(p.pathname) || p.searchParams.has("q"))) {
@@ -508,7 +523,7 @@
 
     const isWhitelistedUrl = (u) => {
       try {
-        const p = new URL(u, window.location.href);
+        const p = new URL(sanitizeRawUrl(u), window.location.href);
         if (p.protocol !== "http:" && p.protocol !== "https:") return false;
         if (isOpenRedirectOnWhitelisted(p)) return false;
         const h = p.hostname.toLowerCase().replace(/^www\./, "");
@@ -521,7 +536,7 @@
 
     const reportLegitExternalNav = (targetUrl, anyExternal = false) => {
       try {
-        const u = new URL(targetUrl || window.location.href, window.location.href);
+        const u = new URL(sanitizeRawUrl(targetUrl || window.location.href), window.location.href);
         const h = u.hostname.toLowerCase().replace(/^www\./, "");
         nativePost(
           {
@@ -538,7 +553,7 @@
 
     const normUrl = (u) => {
       try {
-        const x = new URL(u, window.location.href);
+        const x = new URL(sanitizeRawUrl(u), window.location.href);
         x.hash = "";
         return x.href.replace(/\/+$/, "");
       } catch {
@@ -548,7 +563,7 @@
 
     const isSameSite = (u) => {
       try {
-        const p = new URL(u, window.location.href);
+        const p = new URL(sanitizeRawUrl(u), window.location.href);
         if (p.protocol !== "http:" && p.protocol !== "https:") return false;
         const h = p.hostname.toLowerCase().replace(/^www\./, "");
         return h === hostName || h.endsWith("." + hostName) || getInnerRoot(h) === rootDomain;
@@ -559,7 +574,7 @@
 
     const isExternalAppScheme = (u) => {
       try {
-        const p = new URL(u, window.location.href);
+        const p = new URL(sanitizeRawUrl(u), window.location.href);
         return (
           p.protocol !== "http:" &&
           p.protocol !== "https:" &&
@@ -573,7 +588,7 @@
     };
 
     const decodeParamCandidate = (val) => {
-      let cur = String(val || "").trim();
+      let cur = sanitizeRawUrl(val);
       for (let i = 0; i < 2; i++) {
         if (/%[0-9a-f]{2}/i.test(cur)) {
           try {
@@ -599,7 +614,7 @@
 
     const isRedirectGateway = (u) => {
       try {
-        const p = new URL(u, window.location.href);
+        const p = new URL(sanitizeRawUrl(u), window.location.href);
         if (!isSameSite(u)) return false;
         if (/^\/(go|out|away|redir|redirect|exit|jump|aff)(\/|\.|$)/i.test(p.pathname)) {
           return true;
@@ -664,15 +679,15 @@
 
     const getAnchorHref = (a) => {
       if (!a) return "";
-      if (typeof a.href === "string") return a.href;
+      if (typeof a.href === "string") return sanitizeRawUrl(a.href);
       if (a.href && typeof a.href.baseVal === "string") {
         try {
-          return new URL(a.href.baseVal, window.location.href).href;
+          return new URL(sanitizeRawUrl(a.href.baseVal), window.location.href).href;
         } catch {
-          return a.href.baseVal;
+          return sanitizeRawUrl(a.href.baseVal);
         }
       }
-      const attr = a.getAttribute("href") || a.getAttribute("xlink:href") || "";
+      const attr = sanitizeRawUrl(a.getAttribute("href") || a.getAttribute("xlink:href") || "");
       try {
         return attr ? new URL(attr, window.location.href).href : "";
       } catch {
@@ -681,7 +696,7 @@
     };
 
     const isPseudo = (a) => {
-      const h = (a.getAttribute("href") || a.getAttribute("xlink:href") || "").trim().toLowerCase();
+      const h = sanitizeRawUrl(a.getAttribute("href") || a.getAttribute("xlink:href") || "").toLowerCase();
       return !h || h.startsWith("#") || h.startsWith("javascript:");
     };
 
@@ -989,18 +1004,18 @@
     function matchesAllowedHost(url) {
       if (!allowedUrl) return false;
       try {
-        const eh = new URL(allowedUrl, window.location.href).hostname;
-        const ah = new URL(url, window.location.href).hostname;
+        const eh = new URL(sanitizeRawUrl(allowedUrl), window.location.href).hostname;
+        const ah = new URL(sanitizeRawUrl(url), window.location.href).hostname;
         return eh === ah || ah.endsWith("." + eh) || getInnerRoot(eh) === getInnerRoot(ah);
       } catch {
         return false;
       }
     }
 
-    function isAllowed(url, isNewTab = false) {
+    function isAllowed(url, isNewTab = false, callerWin = window) {
       if (bypassed) return true;
       if (!url) return false;
-      const trimmed = String(url).trim();
+      const trimmed = sanitizeRawUrl(url);
       const lower = trimmed.toLowerCase();
 
       if (lower.startsWith("javascript:") || lower.startsWith("data:")) return false;
@@ -1032,6 +1047,11 @@
         return false;
       }
 
+      // Chặn iframe con tự ý ép đổi hướng toàn bộ cửa sổ chính (_top / _parent) khi không có thao tác người dùng
+      if (callerWin && callerWin !== window && !hasActiveUserGesture() && expired) {
+        return false;
+      }
+
       if (!sameClean && Date.now() - lastAttempt < 1500) return false;
       if (!selfClone && sameClean) return true;
 
@@ -1049,7 +1069,7 @@
       let promoted = false;
       const tryPromoteBlank = (nextUrl) => {
         if (promoted || !promotionOpts || !nextUrl) return false;
-        const cleanNext = String(nextUrl).trim();
+        const cleanNext = sanitizeRawUrl(nextUrl);
         const lowerNext = cleanNext.toLowerCase();
         if (!cleanNext || cleanNext === "about:blank" || lowerNext.startsWith("javascript:") || lowerNext.startsWith("data:")) {
           return false;
@@ -1072,6 +1092,14 @@
         return false;
       };
 
+      const inspectWrittenOAuth = (htmlChunk) => {
+        if (!promotionOpts || promoted || typeof htmlChunk !== "string") return;
+        const match = htmlChunk.match(/(?:action|href|url|location(?:\.href)?)\s*=\s*["']?(https?:\/\/[^"'\s>]+)/i);
+        if (match && match[1]) {
+          tryPromoteBlank(match[1]);
+        }
+      };
+
       if (!promotionOpts) {
         lastAttempt = Date.now();
         reportBlock();
@@ -1079,7 +1107,7 @@
 
       const locState = { href: url || "about:blank" };
       const handleLocationNav = (v) => {
-        const nextVal = String(v);
+        const nextVal = sanitizeRawUrl(v);
         locState.href = nextVal;
         if (!tryPromoteBlank(nextVal) && promotionOpts) {
           lastAttempt = Date.now();
@@ -1118,8 +1146,8 @@
         head: dummyEl(),
         defaultView: null,
         readyState: "complete",
-        write() {},
-        writeln() {},
+        write(s) { inspectWrittenOAuth(s); },
+        writeln(s) { inspectWrittenOAuth(s); },
         close() {},
         open() { return fakeDoc; },
         createElement: dummyEl,
@@ -1175,7 +1203,6 @@
       return winProxy;
     }
 
-    // Chỉ bảo vệ chống mất dữ liệu đang nhập trong form, không gây hộp thoại giả khi duyệt SPA
     const markFormTyping = (e) => {
       if (e.isTrusted) lastFormTypingTime = Date.now();
     };
@@ -1484,6 +1511,35 @@
       });
     } catch {}
 
+    // Chặn kịch bản gọi dispatchEvent(new MouseEvent('click')) trên thẻ <a> nằm ngoài DOM hoặc Shadow DOM
+    try {
+      const origDispatch = EventTarget.prototype.dispatchEvent;
+      EventTarget.prototype.dispatchEvent = maskAsNative(function (ev) {
+        if (!bypassed && ev && typeof ev.type === "string") {
+          const evType = ev.type.toLowerCase();
+          if ((evType === "click" || evType === "auxclick") && this && this.nodeType === 1) {
+            if (this.localName === "a" || this.localName === "area") {
+              const hrefStr = getAnchorHref(this);
+              if (hrefStr && !isPseudo(this) && !isAllowed(hrefStr, opensNew(this))) {
+                lastAttempt = Date.now();
+                reportBlock();
+                return false;
+              }
+            }
+          } else if (evType === "submit" && this && this.tagName === "FORM") {
+            const actionUrl = this.getAttribute("action") || window.location.href;
+            const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
+            if (!safeDest && !isAllowed(actionUrl, opensNew(this))) {
+              lastAttempt = Date.now();
+              reportBlock();
+              return false;
+            }
+          }
+        }
+        return origDispatch.apply(this, arguments);
+      }, "dispatchEvent");
+    } catch {}
+
     function patchWindowEnvironment(w) {
       if (!w || w.__gxEnvLocked) return;
       try {
@@ -1499,10 +1555,10 @@
           const isNew =
             (!cleanTarget || (cleanTarget !== "_self" && cleanTarget !== "_parent" && cleanTarget !== "_top")) &&
             !isTargetExistingFrame(cleanTarget);
-          if (isAllowed(url, isNew)) {
+          if (isAllowed(url, isNew, w)) {
             return origOpen.apply(this, arguments);
           }
-          const trimmed = String(url || "").trim();
+          const trimmed = sanitizeRawUrl(url);
           const isBlankBoot = !trimmed || trimmed === "about:blank";
           const canPromote =
             isBlankBoot &&
@@ -1530,7 +1586,7 @@
         if (locProto) {
           const origAssign = locProto.assign;
           const lockedAssign = maskAsNative(function (url) {
-            if (!bypassed && !isAllowed(String(url), false)) {
+            if (!bypassed && !isAllowed(String(url), false, w)) {
               reportBlock();
               return;
             }
@@ -1544,7 +1600,7 @@
 
           const origReplace = locProto.replace;
           const lockedReplace = maskAsNative(function (url) {
-            if (!bypassed && !isAllowed(String(url), false)) {
+            if (!bypassed && !isAllowed(String(url), false, w)) {
               reportBlock();
               return;
             }
@@ -1579,12 +1635,12 @@
         const guardElementClick = (el, origClickFn, args) => {
           if (!bypassed && el && el.nodeType === 1) {
             if (el.localName === "a" || el.localName === "area") {
-              const hrefStr = typeof el.href === "string" ? el.href : getAnchorHref(el);
-              const isBlobOrData = hrefStr.startsWith("blob:") || hrefStr.startsWith("data:");
+              const hrefStr = getAnchorHref(el);
+              const isBlobOrData = hrefStr.toLowerCase().startsWith("blob:") || hrefStr.toLowerCase().startsWith("data:");
               const dl =
                 el.hasAttribute("download") &&
                 (isBlobOrData || (allowMode !== "NONE" && Date.now() <= allowedUntil));
-              if (!dl && !isAllowed(hrefStr, opensNew(el))) {
+              if (!dl && !isAllowed(hrefStr, opensNew(el), w)) {
                 lastAttempt = Date.now();
                 reportBlock();
                 return;
@@ -1661,7 +1717,7 @@
             if (bypassed || e.navigationType === "reload" || e.hashChange || e.downloadRequest) return;
             const dest = e.destination && e.destination.url;
             if (!dest) return;
-            if (!isAllowed(dest, false) && e.cancelable) {
+            if (!isAllowed(dest, false, w) && e.cancelable) {
               e.preventDefault();
               reportBlock();
             }
@@ -1742,13 +1798,13 @@
     try {
       const origSetAttr = Element.prototype.setAttribute;
       Element.prototype.setAttribute = maskAsNative(function (name, value) {
-        if (!bypassed && this && this.tagName === "IFRAME" && /^srcdoc$/i.test(String(name))) {
+        if (!bypassed && this && this.tagName === "IFRAME" && /^srcdoc$/i.test(String(name).trim())) {
           const res = origSetAttr.call(this, name, injectBootIntoSrcdoc(String(value)));
           try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
           return res;
         }
         const res = origSetAttr.apply(this, arguments);
-        if (!bypassed && this && this.tagName === "OBJECT" && /^data$/i.test(String(name))) {
+        if (!bypassed && this && this.tagName === "OBJECT" && /^data$/i.test(String(name).trim())) {
           try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
         }
         return res;
@@ -1919,7 +1975,7 @@
       for (let i = 0; i < out.length; i++) {
         if (typeof out[i] === "string") {
           out[i] = out[i]
-            .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, "")
+            .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?\s*refresh\s*["']?[^>]*>/gi, "")
             .replace(/<base\b([^>]*?)\btarget\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)([^>]*)>/gi, "<base$1$2>");
         }
       }
@@ -1949,7 +2005,7 @@
       if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
         b.removeAttribute("target");
       }
-      const rawBaseHref = (b.getAttribute("href") || "").trim();
+      const rawBaseHref = sanitizeRawUrl(b.getAttribute("href") || "");
       if (rawBaseHref) {
         try {
           const parsedBase = new URL(rawBaseHref, window.location.href);
@@ -1963,7 +2019,7 @@
     const sanitizeNode = (node) => {
       if (!node || node.nodeType !== 1) return;
       const tag = node.tagName;
-      if (tag === "META" && /^refresh$/i.test(node.getAttribute("http-equiv") || "")) {
+      if (tag === "META" && /^refresh$/i.test((node.getAttribute("http-equiv") || "").trim())) {
         node.remove();
         return;
       }
@@ -1976,7 +2032,9 @@
         return;
       }
       if (node.firstElementChild) {
-        node.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => m.remove());
+        node.querySelectorAll("meta[http-equiv]").forEach((m) => {
+          if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
+        });
         node.querySelectorAll("base").forEach(sanitizeBaseTag);
         node.querySelectorAll("iframe, frame, object").forEach((f) => {
           try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
