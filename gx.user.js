@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      10.0.0
-// @description  Kiến trúc bảo vệ toàn diện: khóa đa tầng iframe, đồng bộ ngăn xếp chạm, chặn Navigation API và chống bẫy data/base trên Orion iOS
+// @version      11.0.0
+// @description  Kiến trúc bảo vệ tối đa: khóa popunder tầng window, chống bẫy trong suốt trong player, chặn location.href và khóa đa tầng iframe trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -268,7 +268,7 @@
   );
 
   // Lớp chặn dự phòng ở Content Script nếu trang dùng CSP khóa hoàn toàn inline <script>
-  document.addEventListener(
+  window.addEventListener(
     "click",
     (e) => {
       if (mainAcked || checkBypassed()) return;
@@ -412,6 +412,7 @@
     let touchMoved = false;
     let trustedGestureDepth = 0;
     let lastVerifiedTapTime = 0;
+    let lastNonLinkTapTime = 0;
     let lastGestureTime = 0;
     let lastAttempt = 0;
     let touchStartX = 0;
@@ -426,7 +427,7 @@
     };
 
     const hasActiveUserGesture = () =>
-      trustedGestureDepth > 0 || Date.now() - lastVerifiedTapTime < 300;
+      trustedGestureDepth > 0 || Date.now() - lastVerifiedTapTime < 250;
 
     const getAnchorHref = (a) => {
       if (!a) return "";
@@ -466,7 +467,42 @@
     const isVisible = (el) => {
       if (!el || el.nodeType !== 1) return false;
       const s = window.getComputedStyle(el);
-      return s.display !== "none" && s.visibility !== "hidden" && parseFloat(s.opacity) >= 0.35;
+      return s.display !== "none" && s.visibility !== "hidden" && parseFloat(s.opacity) >= 0.2;
+    };
+
+    const isTransparentColor = (colorStr) => {
+      if (!colorStr || colorStr === "transparent") return true;
+      const m = colorStr.match(/rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(?:,\s*([0-9.]+)\s*)?\)/i);
+      if (!m) return false;
+      return m[1] !== undefined && parseFloat(m[1]) < 0.05;
+    };
+
+    const hasVisibleGraphicChild = (el) => {
+      const media = el.querySelectorAll("img, svg, picture, canvas");
+      for (let i = 0; i < media.length; i++) {
+        const m = media[i];
+        const mr = m.getBoundingClientRect();
+        const ms = window.getComputedStyle(m);
+        if (mr.width >= 8 && mr.height >= 8 && ms.display !== "none" && parseFloat(ms.opacity) >= 0.2) {
+          return true;
+        }
+      }
+      const icons = el.querySelectorAll("i, span");
+      for (let i = 0; i < icons.length; i++) {
+        const ic = icons[i];
+        const ir = ic.getBoundingClientRect();
+        const is = window.getComputedStyle(ic);
+        if (ir.width >= 6 && ir.height >= 6 && is.backgroundImage && is.backgroundImage !== "none") {
+          return true;
+        }
+        try {
+          const before = window.getComputedStyle(ic, "::before");
+          if (before && before.content && before.content !== "none" && before.content !== '""') {
+            return true;
+          }
+        } catch {}
+      }
+      return false;
     };
 
     const isRealExtLink = (a) => {
@@ -477,11 +513,7 @@
       }
       const s = window.getComputedStyle(a);
       const hasBgImage = s.backgroundImage && s.backgroundImage !== "none" && r.width >= 16 && r.height >= 16;
-      return (
-        a.innerText.trim().length > 0 ||
-        a.querySelector("img, svg, i, span, picture, canvas") !== null ||
-        hasBgImage
-      );
+      return a.innerText.trim().length > 0 || hasVisibleGraphicChild(a) || hasBgImage;
     };
 
     function hasFullPseudoOverlay(el) {
@@ -493,13 +525,10 @@
           const pw = parseFloat(ps.width) || 0;
           const ph = parseFloat(ps.height) || 0;
           const opacity = parseFloat(ps.opacity);
-          const isTransparent =
-            ps.backgroundColor === "rgba(0, 0, 0, 0)" ||
-            ps.backgroundColor === "transparent";
           if (
-            pw >= window.innerWidth * 0.65 &&
-            ph >= window.innerHeight * 0.55 &&
-            (opacity < 0.08 || isTransparent)
+            pw >= Math.min(window.innerWidth * 0.6, 220) &&
+            ph >= Math.min(window.innerHeight * 0.25, 140) &&
+            (opacity < 0.08 || isTransparentColor(ps.backgroundColor))
           ) {
             return true;
           }
@@ -508,18 +537,19 @@
       return false;
     }
 
+    // Vô hiệu hóa lớp phủ trong suốt đè lên màn hình hoặc đè lên khung video player
     function neutralizeInvisibleTrap(target) {
       if (!target || target.nodeType !== 1) return false;
       if (
         target === document.body ||
         target === document.documentElement ||
         target.matches(
-          "video, audio, iframe, frame, canvas, object, embed, input, textarea, select, option, button, [role='button']"
+          "video, audio, iframe, frame, canvas, object, embed, input, textarea, select, option, button, [role='button'], label, svg, path, img"
         )
       ) {
         return false;
       }
-      if (target.closest && target.closest('[class*="player" i], [id*="player" i], [role="dialog"], [aria-modal="true"]')) {
+      if (target.closest && target.closest('[role="dialog"], [aria-modal="true"]')) {
         return false;
       }
 
@@ -535,17 +565,19 @@
       if (s.position !== "fixed" && s.position !== "absolute") return false;
 
       const r = target.getBoundingClientRect();
-      const coversScreen = r.width >= window.innerWidth * 0.65 && r.height >= window.innerHeight * 0.55;
-      if (!coversScreen) return false;
+      const isLargeOverlay =
+        (r.width >= window.innerWidth * 0.65 && r.height >= window.innerHeight * 0.5) ||
+        (r.width >= 200 && r.height >= 120 && Boolean(target.closest('[class*="player" i], [id*="player" i]')));
+      if (!isLargeOverlay) return false;
 
       const isEmptyTrap =
         target.innerText.trim().length === 0 &&
-        !target.querySelector("img, video, canvas, iframe, input, svg");
+        !target.querySelector("video, audio, canvas, iframe, input, button, [role='button'], svg, img");
       if (!isEmptyTrap) return false;
 
       const opacity = parseFloat(s.opacity);
       const isTransparentBg =
-        (s.backgroundColor === "rgba(0, 0, 0, 0)" || s.backgroundColor === "transparent") &&
+        isTransparentColor(s.backgroundColor) &&
         s.backgroundImage === "none" &&
         parseFloat(s.borderTopWidth) === 0;
 
@@ -633,7 +665,7 @@
           r.width > 0 &&
           r.height > 0 &&
           r.width < window.innerWidth * 0.65 &&
-          (nativeBtn || button.innerText.trim().length > 0 || button.querySelector("img, svg, i, span"))
+          (nativeBtn || button.innerText.trim().length > 0 || hasVisibleGraphicChild(button))
         ) {
           allowMode = "BUTTON";
           allowedUrl = null;
@@ -663,7 +695,6 @@
 
       const expired = Date.now() > allowedUntil || allowMode === "NONE";
 
-      // Chỉ cho phép blob: / data: khi có thao tác hợp lệ đi kèm, chặn pop-up data:text/html tự phát
       if (trimmed.startsWith("blob:") || trimmed.startsWith("data:")) {
         return !expired && (hasActiveUserGesture() || allowMode === "BUTTON" || allowMode === "DOMAIN");
       }
@@ -678,12 +709,8 @@
           return allowedUrl ? matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed) : isWhitelistedUrl(trimmed);
         }
         if (allowMode === "EXT_LINK") return matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed);
+        // Nút bấm không được phép mở tab mới tới tên miền quảng cáo lạ
         if (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") {
-          // Chỉ cho phép nút bấm mở tab mới nếu gọi đồng bộ ngay trong cú bấm thật của người dùng
-          if (hasActiveUserGesture() && !gateway) {
-            reportLegitExternalNav(trimmed, false);
-            return true;
-          }
           return isWhitelistedUrl(trimmed);
         }
         return false;
@@ -702,29 +729,106 @@
       return false;
     }
 
+    // Giả lập đối tượng Window chuẩn xác để mã quảng cáo không phát hiện và kích hoạt fallback chuyển hướng
     function fakeWin(url) {
       lastAttempt = Date.now();
       reportBlock();
-      const loc = { href: url || "about:blank", assign() {}, replace() {} };
-      return new Proxy(
+      const locState = { href: url || "about:blank" };
+      const fakeLoc = new Proxy(
         {
-          closed: false,
-          opener: window,
-          location: loc,
-          document: { write() {}, writeln() {}, close() {}, open() {} },
-          focus() {},
-          blur() {},
-          close() { this.closed = true; },
-          postMessage() {}
+          get href() { return locState.href; },
+          set href(v) { locState.href = String(v); },
+          assign(v) { locState.href = String(v); },
+          replace(v) { locState.href = String(v); },
+          reload() {},
+          toString() { return locState.href; }
         },
         {
-          get: (t, p) => (p in t ? t[p] : () => {}),
-          set: (t, p, v) => { t[p] = v; return true; }
+          set(t, p, v) {
+            if (p === "href") locState.href = String(v);
+            return true;
+          }
         }
       );
+      const dummyEl = () => ({
+        style: {},
+        setAttribute() {},
+        getAttribute() { return null; },
+        appendChild() {},
+        removeChild() {},
+        click() {},
+        focus() {}
+      });
+      const fakeDoc = {
+        body: dummyEl(),
+        documentElement: dummyEl(),
+        head: dummyEl(),
+        readyState: "complete",
+        write() {},
+        writeln() {},
+        close() {},
+        open() { return fakeDoc; },
+        createElement: dummyEl,
+        createDocumentFragment: dummyEl,
+        getElementById() { return null; },
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        addEventListener() {},
+        removeEventListener() {}
+      };
+      const baseStub = {
+        [Symbol.toStringTag]: "Window",
+        closed: false,
+        opener: window,
+        top: window.top,
+        parent: window,
+        length: 0,
+        location: fakeLoc,
+        document: fakeDoc,
+        history: { back() {}, forward() {}, go() {}, pushState() {}, replaceState() {} },
+        navigator: window.navigator,
+        screen: window.screen,
+        focus() {},
+        blur() {},
+        close() { this.closed = true; },
+        postMessage() {},
+        addEventListener() {},
+        removeEventListener() {}
+      };
+      const winProxy = new Proxy(baseStub, {
+        get(target, prop) {
+          if (prop === "window" || prop === "self" || prop === "frames" || prop === "globalThis") {
+            return winProxy;
+          }
+          if (prop in target) return target[prop];
+          return () => {};
+        },
+        set(target, prop, value) {
+          if (prop === "location") {
+            locState.href = String(value);
+            return true;
+          }
+          target[prop] = value;
+          return true;
+        }
+      });
+      return winProxy;
     }
 
-    // touchstart chỉ ghi nhận điểm chạm gốc để chống tráo DOM, không mở khóa window.open()
+    // Chặn chuyển hướng cưỡng bức window.location.href = "..." ngay sau cú chạm không phải link
+    window.addEventListener("beforeunload", (e) => {
+      if (bypassed) return;
+      const recentlyTappedNonLink = Date.now() - lastNonLinkTapTime < 4500;
+      const hasValidNavAuth =
+        (allowMode === "DOMAIN" || allowMode === "EXT_LINK" || allowMode === "NEW_TAB" || allowMode === "FORM_SUBMIT") &&
+        Date.now() <= allowedUntil;
+      if (recentlyTappedNonLink && !hasValidNavAuth) {
+        reportBlock();
+        e.preventDefault();
+        e.returnValue = "";
+      }
+    });
+
     window.addEventListener(
       "touchstart",
       (e) => {
@@ -781,8 +885,12 @@
       }
       if (authorize(e, wantsNewTab, 2800)) {
         lastVerifiedTapTime = Date.now();
+        if (allowMode === "BUTTON") {
+          lastNonLinkTapTime = Date.now();
+        }
       } else {
         resetAuth();
+        lastNonLinkTapTime = Date.now();
       }
     };
 
@@ -839,7 +947,7 @@
       }
     }, true);
 
-    function handleDocumentClick(e) {
+    function handleGlobalClick(e) {
       if (bypassed) return;
       if (e.isTrusted) {
         lastGestureTime = Date.now();
@@ -857,6 +965,9 @@
           const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
           if (authorize(e, wantsNewTab, 2500)) {
             lastVerifiedTapTime = Date.now();
+            if (allowMode === "BUTTON") lastNonLinkTapTime = Date.now();
+          } else {
+            lastNonLinkTapTime = Date.now();
           }
         }
         return;
@@ -874,7 +985,7 @@
       const newTab = opensNew(anchor);
 
       if (!e.isTrusted) {
-        if (!isAllowed(href, newTab)) {
+        if (!sameClean || newTab) {
           e.preventDefault();
           e.stopImmediatePropagation();
           reportBlock();
@@ -920,7 +1031,7 @@
       reportLegitExternalNav(href, gateway);
     }
 
-    function handleDocumentSubmit(e) {
+    function handleGlobalSubmit(e) {
       if (bypassed) return;
       const form = e.target;
       if (!form || form.tagName !== "FORM") return;
@@ -964,7 +1075,6 @@
       return origFn.apply(form, args);
     };
 
-    // Khóa đồng bộ cả trang chính lẫn mọi khung iframe cùng nguồn
     function patchWindowEnvironment(w) {
       if (!w || w.__gxEnvLocked) return;
       try {
@@ -1076,19 +1186,18 @@
       } catch {}
 
       try {
-        if (w.document) {
-          w.document.addEventListener("click", (e) => {
-            if (e.isTrusted) trustedGestureDepth += 1;
-            try {
-              handleDocumentClick(e);
-            } finally {
-              if (e.isTrusted) {
-                setTimeout(() => { trustedGestureDepth = Math.max(0, trustedGestureDepth - 1); }, 0);
-              }
+        w.addEventListener("click", (e) => {
+          if (e.isTrusted) trustedGestureDepth += 1;
+          try {
+            handleGlobalClick(e);
+          } finally {
+            if (e.isTrusted) {
+              setTimeout(() => { trustedGestureDepth = Math.max(0, trustedGestureDepth - 1); }, 0);
             }
-          }, true);
-          w.document.addEventListener("submit", handleDocumentSubmit, true);
-        }
+          }
+        }, true);
+        w.addEventListener("auxclick", handleGlobalClick, true);
+        w.addEventListener("submit", handleGlobalSubmit, true);
       } catch {}
     }
 
@@ -1140,6 +1249,30 @@
         }
       } catch {}
     });
+
+    try {
+      const origInsertAdjHTML = Element.prototype.insertAdjacentHTML;
+      if (typeof origInsertAdjHTML === "function") {
+        Element.prototype.insertAdjacentHTML = function (pos, html) {
+          const res = origInsertAdjHTML.apply(this, arguments);
+          if (typeof html === "string" && /<i?frame\b/i.test(html)) {
+            patchFrameTree(this.parentElement || this);
+          }
+          return res;
+        };
+      }
+    } catch {}
+
+    try {
+      const origInsertNode = Range.prototype.insertNode;
+      if (typeof origInsertNode === "function") {
+        Range.prototype.insertNode = function (node) {
+          const res = origInsertNode.apply(this, arguments);
+          if (node && node.nodeType === 1) patchFrameTree(node);
+          return res;
+        };
+      }
+    } catch {}
 
     try {
       const cwDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "contentWindow");
