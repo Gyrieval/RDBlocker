@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      11.0.0
-// @description  Kiến trúc bảo vệ tối đa: khóa popunder tầng window, chống bẫy trong suốt trong player, chặn location.href và khóa đa tầng iframe trên Orion iOS
+// @version      12.0.0
+// @description  Kiến trúc bảo vệ toàn diện: chống bẫy opacity thẻ cha, khóa tiêm link ở touchend, phân tích URLSearchParams và hỗ trợ OAuth trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -85,7 +85,8 @@
   const checkBypassed = () => !enabled || isWhitelistedHost(curHost, curRoot);
 
   const addBlock = () => {
-    blockedCount += 1;
+    const latest = Number(getVal("gx_blocked_count", blockedCount)) || 0;
+    blockedCount = latest + 1;
     setVal("gx_blocked_count", blockedCount);
   };
 
@@ -236,8 +237,9 @@
           }
         );
       }
-      GM_registerMenuCommand(`🛡️ Đã chặn: ${blockedCount} lần`, () => {
-        if (confirm(`Đã chặn ${blockedCount} lần. Đặt lại về 0?`)) {
+      GM_registerMenuCommand(`🛡️ Xem & Đặt lại bộ đếm chặn`, () => {
+        const currentTotal = Number(getVal("gx_blocked_count", blockedCount)) || 0;
+        if (confirm(`Tổng số lần đã chặn: ${currentTotal}.\nBạn có muốn đặt lại bộ đếm về 0 không?`)) {
           blockedCount = 0;
           setVal("gx_blocked_count", 0);
         }
@@ -305,6 +307,28 @@
           return;
         }
       }
+    },
+    true
+  );
+
+  window.addEventListener(
+    "submit",
+    (e) => {
+      if (mainAcked || checkBypassed()) return;
+      const form = e.target;
+      if (!form || form.tagName !== "FORM") return;
+      try {
+        const actionUrl = form.getAttribute("action") || window.location.href;
+        const u = new URL(actionUrl, window.location.href);
+        const h = u.hostname.toLowerCase().replace(/^www\./, "");
+        const r = getRoot(h);
+        const same = h === curHost || h.endsWith("." + curHost) || r === curRoot;
+        if (!e.isTrusted && !same && !isWhitelistedHost(h, r)) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          addBlock();
+        }
+      } catch {}
     },
     true
   );
@@ -393,9 +417,20 @@
       try {
         const p = new URL(u, window.location.href);
         if (!isSameSite(u)) return false;
-        const pathMatch = /^\/(go|out|away|redir|redirect|exit|jump|aff)\b/i.test(p.pathname);
-        const queryMatch = /(?:^|[?&])(url|to|dest|destination|target|redirect|redir|link)=https?%3A|https?:\/\//i.test(p.search);
-        return pathMatch || queryMatch;
+        if (/^\/(go|out|away|redir|redirect|exit|jump|aff)\b/i.test(p.pathname)) {
+          return true;
+        }
+        for (const [k, v] of p.searchParams.entries()) {
+          if (/^(url|to|dest|destination|target|redirect|redir|link|u|r|goto)$/i.test(k)) {
+            if (/^https?:\/\//i.test(v)) {
+              const destUrl = new URL(v);
+              if (!isSameSite(destUrl.href) && !isWhitelistedUrl(destUrl.href)) {
+                return true;
+              }
+            }
+          }
+        }
+        return false;
       } catch {
         return false;
       }
@@ -428,6 +463,15 @@
 
     const hasActiveUserGesture = () =>
       trustedGestureDepth > 0 || Date.now() - lastVerifiedTapTime < 250;
+
+    const isInjectedExternalAnchor = (anchor, sameClean) => {
+      if (sameClean || !anchor) return false;
+      if (Date.now() - touchOriginTime >= 1500) return false;
+      if (touchOriginAnchor === anchor) return false;
+      if (!touchOriginAnchor) return true;
+      if (touchOriginTarget && anchor.contains(touchOriginTarget)) return false;
+      return true;
+    };
 
     const getAnchorHref = (a) => {
       if (!a) return "";
@@ -464,10 +508,26 @@
       return Boolean(t && t !== "_self" && t !== "_parent" && t !== "_top");
     };
 
-    const isVisible = (el) => {
+    // Kiểm tra độ hiển thị thực tế xuyên suốt toàn bộ chuỗi thẻ cha (chống bẫy opacity thẻ cha)
+    const isEffectiveVisible = (el) => {
       if (!el || el.nodeType !== 1) return false;
-      const s = window.getComputedStyle(el);
-      return s.display !== "none" && s.visibility !== "hidden" && parseFloat(s.opacity) >= 0.2;
+      if (typeof el.checkVisibility === "function") {
+        try {
+          if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) {
+            return false;
+          }
+        } catch {}
+      }
+      let cur = el;
+      while (cur && cur.nodeType === 1) {
+        const s = window.getComputedStyle(cur);
+        if (s.display === "none" || s.visibility === "hidden" || parseFloat(s.opacity) < 0.2) {
+          return false;
+        }
+        if (cur === document.body) break;
+        cur = cur.parentElement;
+      }
+      return true;
     };
 
     const isTransparentColor = (colorStr) => {
@@ -506,7 +566,7 @@
     };
 
     const isRealExtLink = (a) => {
-      if (!a || !isVisible(a)) return false;
+      if (!a || !isEffectiveVisible(a)) return false;
       const r = a.getBoundingClientRect();
       if (!r.width || !r.height || (r.width >= window.innerWidth * 0.65 && r.height >= window.innerHeight * 0.65)) {
         return false;
@@ -537,7 +597,6 @@
       return false;
     }
 
-    // Vô hiệu hóa lớp phủ trong suốt đè lên màn hình hoặc đè lên khung video player
     function neutralizeInvisibleTrap(target) {
       if (!target || target.nodeType !== 1) return false;
       if (
@@ -570,12 +629,20 @@
         (r.width >= 200 && r.height >= 120 && Boolean(target.closest('[class*="player" i], [id*="player" i]')));
       if (!isLargeOverlay) return false;
 
+      const opacity = parseFloat(s.opacity);
+      if (opacity < 0.05) {
+        try {
+          target.style.setProperty("pointer-events", "none", "important");
+        } catch {}
+        reportBlock();
+        return true;
+      }
+
       const isEmptyTrap =
         target.innerText.trim().length === 0 &&
         !target.querySelector("video, audio, canvas, iframe, input, button, [role='button'], svg, img");
       if (!isEmptyTrap) return false;
 
-      const opacity = parseFloat(s.opacity);
       const isTransparentBg =
         isTransparentColor(s.backgroundColor) &&
         s.backgroundImage === "none" &&
@@ -587,6 +654,17 @@
         } catch {}
         reportBlock();
         return true;
+      }
+      return false;
+    }
+
+    // Quét toàn bộ chuỗi phần tử chạm để bắt cả thẻ cha tàng hình bọc quanh thẻ <a>
+    function neutralizeTrapInEvent(e) {
+      const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
+      for (let i = 0; i < path.length; i++) {
+        const node = path[i];
+        if (!node || node === document.body || node === document.documentElement) break;
+        if (neutralizeInvisibleTrap(node)) return true;
       }
       return false;
     }
@@ -642,6 +720,9 @@
         const href = getAnchorHref(anchor);
         const gateway = isRedirectGateway(href);
         const same = isSameSite(href) && !gateway;
+        if (isInjectedExternalAnchor(anchor, same)) {
+          return false;
+        }
         if (same || isRealExtLink(anchor)) {
           lockedA = anchor;
           lockedHref = href;
@@ -659,7 +740,7 @@
           return true;
         }
       }
-      if (button && isVisible(button)) {
+      if (button && isEffectiveVisible(button)) {
         const r = button.getBoundingClientRect();
         if (
           r.width > 0 &&
@@ -709,7 +790,6 @@
           return allowedUrl ? matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed) : isWhitelistedUrl(trimmed);
         }
         if (allowMode === "EXT_LINK") return matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed);
-        // Nút bấm không được phép mở tab mới tới tên miền quảng cáo lạ
         if (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") {
           return isWhitelistedUrl(trimmed);
         }
@@ -729,23 +809,57 @@
       return false;
     }
 
-    // Giả lập đối tượng Window chuẩn xác để mã quảng cáo không phát hiện và kích hoạt fallback chuyển hướng
-    function fakeWin(url) {
-      lastAttempt = Date.now();
-      reportBlock();
+    function fakeWin(url, promotionOpts) {
+      let promoted = false;
+      const tryPromoteBlank = (nextUrl) => {
+        if (promoted || !promotionOpts || !nextUrl) return false;
+        const cleanNext = String(nextUrl).trim();
+        if (!cleanNext || cleanNext === "about:blank" || /^javascript:/i.test(cleanNext)) return false;
+        const isSafeTarget =
+          (isSameSite(cleanNext) && !isRedirectGateway(cleanNext)) ||
+          isWhitelistedUrl(cleanNext);
+        if (isSafeTarget) {
+          promoted = true;
+          try {
+            promotionOpts.origOpen.call(
+              promotionOpts.ownerWin,
+              cleanNext,
+              promotionOpts.target || "_blank",
+              promotionOpts.features
+            );
+          } catch {}
+          return true;
+        }
+        return false;
+      };
+
+      if (!promotionOpts) {
+        lastAttempt = Date.now();
+        reportBlock();
+      }
+
       const locState = { href: url || "about:blank" };
+      const handleLocationNav = (v) => {
+        const nextVal = String(v);
+        locState.href = nextVal;
+        if (!tryPromoteBlank(nextVal) && promotionOpts) {
+          lastAttempt = Date.now();
+          reportBlock();
+        }
+      };
+
       const fakeLoc = new Proxy(
         {
           get href() { return locState.href; },
-          set href(v) { locState.href = String(v); },
-          assign(v) { locState.href = String(v); },
-          replace(v) { locState.href = String(v); },
+          set href(v) { handleLocationNav(v); },
+          assign(v) { handleLocationNav(v); },
+          replace(v) { handleLocationNav(v); },
           reload() {},
           toString() { return locState.href; }
         },
         {
           set(t, p, v) {
-            if (p === "href") locState.href = String(v);
+            if (p === "href") handleLocationNav(v);
             return true;
           }
         }
@@ -805,7 +919,7 @@
         },
         set(target, prop, value) {
           if (prop === "location") {
-            locState.href = String(value);
+            handleLocationNav(value);
             return true;
           }
           target[prop] = value;
@@ -815,14 +929,11 @@
       return winProxy;
     }
 
-    // Chặn chuyển hướng cưỡng bức window.location.href = "..." ngay sau cú chạm không phải link
+    // Chỉ kích hoạt beforeunload khi chạm vào vùng trống/video (allowMode === "NONE"), tránh chặn nhầm nút bấm
     window.addEventListener("beforeunload", (e) => {
       if (bypassed) return;
-      const recentlyTappedNonLink = Date.now() - lastNonLinkTapTime < 4500;
-      const hasValidNavAuth =
-        (allowMode === "DOMAIN" || allowMode === "EXT_LINK" || allowMode === "NEW_TAB" || allowMode === "FORM_SUBMIT") &&
-        Date.now() <= allowedUntil;
-      if (recentlyTappedNonLink && !hasValidNavAuth) {
+      const recentlyTappedEmptyArea = Date.now() - lastNonLinkTapTime < 3000;
+      if (recentlyTappedEmptyArea && allowMode === "NONE") {
         reportBlock();
         e.preventDefault();
         e.returnValue = "";
@@ -838,7 +949,7 @@
           touchStartX = e.touches[0].clientX;
           touchStartY = e.touches[0].clientY;
         }
-        if (neutralizeInvisibleTrap(e.target)) {
+        if (neutralizeTrapInEvent(e)) {
           e.preventDefault();
           e.stopImmediatePropagation();
           resetAuth();
@@ -877,7 +988,7 @@
     const runVerifiedPress = (e, wantsNewTab) => {
       if (!e.isTrusted || bypassed) return;
       lastGestureTime = Date.now();
-      if (neutralizeInvisibleTrap(e.target)) {
+      if (neutralizeTrapInEvent(e)) {
         e.preventDefault();
         e.stopImmediatePropagation();
         resetAuth();
@@ -885,9 +996,6 @@
       }
       if (authorize(e, wantsNewTab, 2800)) {
         lastVerifiedTapTime = Date.now();
-        if (allowMode === "BUTTON") {
-          lastNonLinkTapTime = Date.now();
-        }
       } else {
         resetAuth();
         lastNonLinkTapTime = Date.now();
@@ -951,7 +1059,7 @@
       if (bypassed) return;
       if (e.isTrusted) {
         lastGestureTime = Date.now();
-        if (neutralizeInvisibleTrap(e.target)) {
+        if (neutralizeTrapInEvent(e)) {
           e.preventDefault();
           e.stopImmediatePropagation();
           resetAuth();
@@ -965,7 +1073,6 @@
           const wantsNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey;
           if (authorize(e, wantsNewTab, 2500)) {
             lastVerifiedTapTime = Date.now();
-            if (allowMode === "BUTTON") lastNonLinkTapTime = Date.now();
           } else {
             lastNonLinkTapTime = Date.now();
           }
@@ -993,13 +1100,7 @@
         return;
       }
 
-      const wasInjectedMidTap =
-        !sameClean &&
-        Date.now() - touchOriginTime < 1200 &&
-        touchOriginAnchor !== anchor &&
-        (!touchOriginTarget || !anchor.contains(touchOriginTarget));
-
-      if (wasInjectedMidTap) {
+      if (isInjectedExternalAnchor(anchor, sameClean)) {
         e.preventDefault();
         e.stopImmediatePropagation();
         resetAuth();
@@ -1085,9 +1186,21 @@
 
       try {
         const origOpen = w.open;
-        const lockedOpen = function (url, target) {
+        const lockedOpen = function (url, target, features) {
           const isNew = !target || (target !== "_self" && target !== "_parent" && target !== "_top");
-          return isAllowed(url, isNew) ? origOpen.apply(this, arguments) : fakeWin(url);
+          if (isAllowed(url, isNew)) {
+            return origOpen.apply(this, arguments);
+          }
+          const trimmed = String(url || "").trim();
+          const isBlankBoot = !trimmed || trimmed === "about:blank";
+          const canPromote =
+            isBlankBoot &&
+            hasActiveUserGesture() &&
+            (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT");
+          return fakeWin(
+            url,
+            canPromote ? { origOpen, ownerWin: this || w, target, features } : null
+          );
         };
         try {
           Object.defineProperty(w, "open", { configurable: false, writable: false, value: lockedOpen });
