@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      15.0.0
-// @description  Kiến trúc bảo vệ tối đa: hoàn thiện fakeWin chống anti-adblock, hỗ trợ named-iframe, phòng thủ CSP Content-Script và tối ưu tốc độ chạm trên Orion iOS
+// @version      16.0.0
+// @description  Kiến trúc bảo vệ tối đa: chống tráo link pha bubble, vá lỗ hổng no-referrer, khóa outerHTML/document.write và tối ưu SPA trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -171,7 +171,7 @@
     }
   }
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (kể cả khi trang ẩn referrer)
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -190,8 +190,7 @@
 
       const lastTouch = getVal("gx_last_touch", null);
       const spawnedRightAfterTouch =
-        window.history.length <= 3 &&
-        lastTouch &&
+        Boolean(lastTouch) &&
         Date.now() - lastTouch.time < 1500 &&
         Boolean(lastTouch.root) &&
         lastTouch.root !== curRoot &&
@@ -302,13 +301,14 @@
     for (let i = 0; i < path.length; i++) {
       const node = path[i];
       if (!node || node.nodeType !== 1 || node === document.body || node === document.documentElement) break;
-      if (node.matches("video, audio, iframe, input, textarea, select, button, [role='button'], img, svg")) continue;
+      if (node.matches("video, audio, iframe, input, textarea, select, button, [role='button'], svg")) continue;
       if (node.closest && node.closest('[role="dialog"], [aria-modal="true"]')) continue;
       const r = node.getBoundingClientRect();
       if (r.width < 200 || r.height < 120) continue;
       const s = window.getComputedStyle(node);
       if (s.position !== "fixed" && s.position !== "absolute") continue;
       const opacity = parseFloat(s.opacity);
+      if ((node.tagName === "IMG" || node.tagName === "LABEL") && opacity >= 0.08) continue;
       const isTransparent =
         opacity < 0.08 ||
         ((s.backgroundColor === "rgba(0, 0, 0, 0)" || s.backgroundColor === "transparent") &&
@@ -758,7 +758,7 @@
         target === document.body ||
         target === document.documentElement ||
         target.matches(
-          "video, audio, iframe, frame, canvas, object, embed, input, textarea, select, option, button, [role='button'], label, svg, path, img"
+          "video, audio, iframe, frame, canvas, object, embed, input, textarea, select, option, button, [role='button'], svg, path"
         )
       ) {
         return false;
@@ -787,13 +787,15 @@
       if (!isLargeOverlay) return false;
 
       const opacity = parseFloat(s.opacity);
-      if (opacity < 0.05) {
+      if (opacity < 0.08) {
         try {
           target.style.setProperty("pointer-events", "none", "important");
         } catch {}
         reportBlock();
         return true;
       }
+
+      if (target.tagName === "IMG" || target.tagName === "LABEL") return false;
 
       const isEmptyTrap =
         target.innerText.trim().length === 0 &&
@@ -805,7 +807,7 @@
         s.backgroundImage === "none" &&
         parseFloat(s.borderTopWidth) === 0;
 
-      if (opacity < 0.08 || isTransparentBg) {
+      if (isTransparentBg) {
         try {
           target.style.setProperty("pointer-events", "none", "important");
         } catch {}
@@ -958,6 +960,7 @@
         }
         if (allowMode === "EXT_LINK") return matchesAllowedHost(trimmed) || isWhitelistedUrl(trimmed);
         if (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") {
+          if (sameClean && !selfClone && hasActiveUserGesture()) return true;
           return isWhitelistedUrl(trimmed);
         }
         return false;
@@ -1309,6 +1312,41 @@
       reportLegitExternalNav(href, gateway);
     }
 
+    // Chốt hậu kiểm pha bubble: ngăn quảng cáo tráo đổi anchor.href hoặc target sau khi pha capture đã duyệt
+    function verifyPostBubbleClick(e) {
+      if (bypassed || e.defaultPrevented) return;
+      const { anchor } = findControls(e);
+      if (!anchor || isPseudo(anchor)) return;
+
+      let href = getAnchorHref(anchor);
+      if (lockedA === anchor && lockedHref && href !== lockedHref) {
+        try { anchor.setAttribute("href", lockedHref); } catch {}
+        href = lockedHref;
+      }
+
+      const gateway = isRedirectGateway(href);
+      const sameClean = isSameSite(href) && !gateway;
+      const newTab = opensNew(anchor);
+
+      if (!e.isTrusted && (!sameClean || newTab)) {
+        e.preventDefault();
+        reportBlock();
+        return;
+      }
+
+      if (sameClean) {
+        if (newTab && allowMode !== "NEW_TAB") {
+          try { anchor.setAttribute("target", "_self"); } catch {}
+        }
+        return;
+      }
+
+      if (!isAllowed(href, newTab)) {
+        e.preventDefault();
+        reportBlock();
+      }
+    }
+
     function handleGlobalSubmit(e) {
       if (bypassed) return;
       const form = e.target;
@@ -1517,6 +1555,7 @@
             }
           }
         }, true);
+        w.addEventListener("click", verifyPostBubbleClick, false);
         w.addEventListener("auxclick", handleGlobalClick, true);
         w.addEventListener("submit", handleGlobalSubmit, true);
       } catch {}
@@ -1613,6 +1652,23 @@
     });
 
     try {
+      const ohDesc = Object.getOwnPropertyDescriptor(Element.prototype, "outerHTML");
+      if (ohDesc && ohDesc.set) {
+        Object.defineProperty(Element.prototype, "outerHTML", {
+          configurable: true,
+          get: ohDesc.get,
+          set: function (html) {
+            const parent = this.parentElement;
+            ohDesc.set.call(this, html);
+            if (parent && typeof html === "string" && /<i?frame\b/i.test(html)) {
+              patchFrameTree(parent);
+            }
+          }
+        });
+      }
+    } catch {}
+
+    try {
       const origInsertAdjHTML = Element.prototype.insertAdjacentHTML;
       if (typeof origInsertAdjHTML === "function") {
         Element.prototype.insertAdjacentHTML = function (pos, html) {
@@ -1682,13 +1738,13 @@
             }
             if (sameOrigin) {
               const now = Date.now();
-              if (now - historySpamWindowStart > 2000) {
+              if (now - historySpamWindowStart > 1500) {
                 historySpamWindowStart = now;
                 historySpamCount = 1;
               } else {
                 historySpamCount += 1;
               }
-              if (historySpamCount >= 2) {
+              if (historySpamCount >= 3) {
                 reportBlock();
                 return;
               }
@@ -1699,12 +1755,35 @@
       };
     } catch {}
 
+    const sanitizeWrittenHtml = (args) => {
+      if (bypassed) return args;
+      const out = Array.from(args);
+      for (let i = 0; i < out.length; i++) {
+        if (typeof out[i] === "string") {
+          out[i] = out[i]
+            .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, "")
+            .replace(/<base\b[^>]*target\s*=\s*["']?_blank["']?[^>]*>/gi, "");
+        }
+      }
+      return out;
+    };
+
     try {
       const origWrite = Document.prototype.write;
       Document.prototype.write = function () {
         if (!bypassed && this === document && this.readyState === "complete") return;
-        return origWrite.apply(this, arguments);
+        return origWrite.apply(this, sanitizeWrittenHtml(arguments));
       };
+    } catch {}
+
+    try {
+      const origWriteln = Document.prototype.writeln;
+      if (typeof origWriteln === "function") {
+        Document.prototype.writeln = function () {
+          if (!bypassed && this === document && this.readyState === "complete") return;
+          return origWriteln.apply(this, sanitizeWrittenHtml(arguments));
+        };
+      }
     } catch {}
 
     const sanitizeBaseTag = (b) => {
