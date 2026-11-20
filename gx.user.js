@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      24.0.0
-// @description  Vá lỗi đẩy về trang tìm kiếm, hỗ trợ đa công cụ tìm kiếm, chặn redirect/pop-under và bẫy tàng hình trên Orion iOS
+// @version      25.0.0
+// @description  Vá lỗi không tải được ảnh CDN/Base64, tối ưu lazy-load ảnh, chặn redirect/pop-under và bẫy tàng hình trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -1665,7 +1665,7 @@
             const res = origCreateObjUrl.apply(this, arguments);
             try {
               const t = (obj && obj.type ? String(obj.type) : "").toLowerCase();
-              if (t.includes("html") || t.includes("svg") || t.includes("xml")) {
+              if (t.includes("html") || t.includes("xml")) {
                 blockedBlobUrls.add(res);
               }
             } catch {}
@@ -1962,7 +1962,15 @@
       if (isExternalAppScheme(cleanOrig)) return true;
       if (lower.startsWith("blob:") && blockedBlobUrls.has(cleanOrig)) return true;
       if (lower.startsWith("data:text/html") || lower.startsWith("data:application/xhtml")) {
-        if (lower.includes(";base64,")) return true;
+        const b64Idx = lower.indexOf(";base64,");
+        if (b64Idx !== -1) {
+          try {
+            const decodedHtml = atob(cleanOrig.slice(b64Idx + 8, b64Idx + 8200));
+            return /<script|location\s*[.=]|window\.open|http-equiv\s*=\s*["']?refresh/i.test(decodedHtml);
+          } catch {
+            return true;
+          }
+        }
         return /<script|location|window\.open|http-equiv/i.test(lower);
       }
       return false;
@@ -2260,19 +2268,11 @@
       }
     } catch {}
 
+    // Chỉ xóa target="_blank" trên thẻ <base>, giữ nguyên <base href="..."> để không làm hỏng đường dẫn ảnh CDN
     const sanitizeBaseTag = (b) => {
       const t = (b.getAttribute("target") || "").trim();
       if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
         b.removeAttribute("target");
-      }
-      const rawBaseHref = sanitizeRawUrl(b.getAttribute("href") || "");
-      if (rawBaseHref) {
-        try {
-          const parsedBase = new URL(rawBaseHref, window.location.href);
-          if (!isSameSite(parsedBase.href)) {
-            b.remove();
-          }
-        } catch {}
       }
     };
 
@@ -2296,7 +2296,7 @@
         node.querySelectorAll("meta[http-equiv]").forEach((m) => {
           if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
         });
-        node.querySelectorAll("base").forEach(sanitizeBaseTag);
+        node.querySelectorAll("base[target]").forEach(sanitizeBaseTag);
         node.querySelectorAll("iframe, frame, object").forEach((f) => {
           if (f.tagName === "IFRAME") sanitizeSandboxAttr(f);
           try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
@@ -2317,7 +2317,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["http-equiv", "target", "href", "src", "srcdoc", "data", "sandbox"]
+      attributeFilter: ["http-equiv", "target", "srcdoc", "sandbox"]
     };
 
     const obs = new MutationObserver((mutations) => {
