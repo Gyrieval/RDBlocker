@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      21.0.0
-// @description  Kiến trúc bảo vệ tối đa: chặn blob:text/html, khóa iframe data:text/html, quét DOM 0ms và chống auto-redirect hẹn giờ trên Orion iOS
+// @version      23.0.0
+// @description  Phiên bản tối ưu toàn diện: chặn redirect, pop-under, bẫy tàng hình, iframe sandbox/write và tối ưu hiệu năng trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -206,7 +206,7 @@
     );
   };
 
-  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc (thay thế background.js)
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -217,13 +217,20 @@
         refRoot = getRoot(refHost);
       }
 
+      const lastTouch = getVal("gx_last_touch", null);
+      const refIsWhitelisted = isWhitelistedHost(refHost, refRoot);
+      const refIsOpenRedirect = isKnownOpenRedirectUrl(document.referrer);
+
       const fromExternalSite =
         Boolean(refRoot) &&
         refRoot !== curRoot &&
-        (!isWhitelistedHost(refHost, refRoot) || isKnownOpenRedirectUrl(document.referrer));
+        (!refIsWhitelisted ||
+          (refIsOpenRedirect &&
+            Boolean(lastTouch) &&
+            Boolean(lastTouch.root) &&
+            !isWhitelistedHost(lastTouch.host, lastTouch.root)));
       const spawnedByOpener = Boolean(window.opener);
 
-      const lastTouch = getVal("gx_last_touch", null);
       const spawnedRightAfterTouch =
         Boolean(lastTouch) &&
         Date.now() - lastTouch.time < 5000 &&
@@ -270,7 +277,7 @@
   let lastTouchRecordMs = 0;
   const recordTouchActivity = (e) => {
     if (e && e.isTrusted === false) return;
-    if (checkBypassed() || !curRoot) return;
+    if (!enabled || !curRoot) return;
     const now = Date.now();
     if (now - lastTouchRecordMs < 150) return;
     lastTouchRecordMs = now;
@@ -338,7 +345,20 @@
     true
   );
 
-  // Lớp phòng thủ đầy đủ ở Content Script dành riêng cho trang dùng CSP khóa hoàn toàn inline <script>
+  // Lớp phòng thủ dự phòng ở Content Script dành riêng cho trang dùng CSP khóa hoàn toàn inline <script>
+  let csTouchAnchor = null;
+  let csTouchTime = 0;
+
+  const findAnchorInPath = (e) => {
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
+    for (let i = 0; i < path.length; i++) {
+      const n = path[i];
+      if (!n || n.nodeType !== 1 || n === document.body || n === document.documentElement) break;
+      if ((n.localName === "a" || n.localName === "area") && n.hasAttribute("href")) return n;
+    }
+    return null;
+  };
+
   const neutralizeContentScriptOverlay = (e) => {
     const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
     for (let i = 0; i < path.length; i++) {
@@ -374,7 +394,11 @@
       if (neutralizeContentScriptOverlay(e)) {
         e.preventDefault();
         e.stopImmediatePropagation();
+        csTouchAnchor = null;
+        return;
       }
+      csTouchAnchor = findAnchorInPath(e);
+      csTouchTime = Date.now();
     },
     true
   );
@@ -388,51 +412,52 @@
         e.stopImmediatePropagation();
         return;
       }
-      const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
-      for (let i = 0; i < path.length; i++) {
-        const n = path[i];
-        if (!n || n.nodeType !== 1) continue;
-        if ((n.localName === "a" || n.localName === "area") && n.hasAttribute("href")) {
-          const rawHref = (n.getAttribute("href") || "").replace(/[\x00-\x1f\x7f]/g, "").trim();
-          if (!rawHref || rawHref.startsWith("#") || rawHref.toLowerCase().startsWith("javascript:")) return;
-          try {
-            const u = new URL(rawHref, window.location.href);
-            const h = u.hostname.toLowerCase().replace(/^www\./, "");
-            const r = getRoot(h);
-            const isGateway =
-              (h === curHost || h.endsWith("." + curHost) || r === curRoot) &&
-              /^\/(go|out|away|redir|redirect|exit|jump|aff)(\/|\.|$)/i.test(u.pathname);
-            const same = (h === curHost || h.endsWith("." + curHost) || r === curRoot) && !isGateway;
-            const targetAttr = (n.getAttribute("target") || "").trim();
-            const opensNewTab = targetAttr && targetAttr !== "_self" && targetAttr !== "_parent" && targetAttr !== "_top";
+      const n = findAnchorInPath(e);
+      if (!n) return;
 
-            if (!e.isTrusted && (!same || opensNewTab)) {
-              e.preventDefault();
-              e.stopImmediatePropagation();
-              addBlock();
-              return;
-            }
-            if (same && opensNewTab && u.href.split("#")[0] === window.location.href.split("#")[0]) {
-              e.preventDefault();
-              e.stopImmediatePropagation();
-              addBlock();
-              return;
-            }
-            const rect = n.getBoundingClientRect();
-            const isOverlay = rect.width >= window.innerWidth * 0.65 && rect.height >= window.innerHeight * 0.65;
-            if (!same && (isOverlay || rect.width === 0 || rect.height === 0)) {
-              e.preventDefault();
-              e.stopImmediatePropagation();
-              addBlock();
-              return;
-            }
-            if (!same) {
-              setVal("gx_legit_nav", { host: h, root: r, anyExternal: false, time: Date.now() });
-            }
-          } catch {}
+      const rawHref = (n.getAttribute("href") || "").replace(/[\x00-\x1f\x7f]/g, "").trim();
+      if (!rawHref || rawHref.startsWith("#") || rawHref.toLowerCase().startsWith("javascript:")) return;
+      try {
+        const u = new URL(rawHref, window.location.href);
+        const h = u.hostname.toLowerCase().replace(/^www\./, "");
+        const r = getRoot(h);
+        const isGateway =
+          (h === curHost || h.endsWith("." + curHost) || r === curRoot) &&
+          /^\/(go|out|away|redir|redirect|exit|jump|aff)(\/|\.|$)/i.test(u.pathname);
+        const same = (h === curHost || h.endsWith("." + curHost) || r === curRoot) && !isGateway;
+        const targetAttr = (n.getAttribute("target") || "").trim();
+        const opensNewTab = targetAttr && targetAttr !== "_self" && targetAttr !== "_parent" && targetAttr !== "_top";
+
+        if (!e.isTrusted && (!same || opensNewTab)) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          addBlock();
           return;
         }
-      }
+        if (!same && Date.now() - csTouchTime < 2000 && csTouchAnchor !== n) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          addBlock();
+          return;
+        }
+        if (same && opensNewTab && u.href.split("#")[0] === window.location.href.split("#")[0]) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          addBlock();
+          return;
+        }
+        const rect = n.getBoundingClientRect();
+        const isOverlay = rect.width >= window.innerWidth * 0.65 && rect.height >= window.innerHeight * 0.65;
+        if (!same && (isOverlay || rect.width === 0 || rect.height === 0)) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          addBlock();
+          return;
+        }
+        if (!same) {
+          setVal("gx_legit_nav", { host: h, root: r, anyExternal: false, time: Date.now() });
+        }
+      } catch {}
     },
     true
   );
@@ -459,6 +484,28 @@
     true
   );
 
+  const cleanFallbackNode = (node) => {
+    if (!node || node.nodeType !== 1) return;
+    if (node.tagName === "META" && /^refresh$/i.test((node.getAttribute("http-equiv") || "").trim())) {
+      node.remove();
+      return;
+    }
+    if (node.tagName === "BASE") {
+      const t = (node.getAttribute("target") || "").trim();
+      if (t && t !== "_self" && t !== "_parent" && t !== "_top") node.removeAttribute("target");
+      return;
+    }
+    if (node.firstElementChild) {
+      node.querySelectorAll("meta[http-equiv]").forEach((m) => {
+        if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
+      });
+      node.querySelectorAll("base[target]").forEach((b) => {
+        const t = (b.getAttribute("target") || "").trim();
+        if (t && t !== "_self" && t !== "_parent" && t !== "_top") b.removeAttribute("target");
+      });
+    }
+  };
+
   const fallbackDomObserver = new MutationObserver((mutations) => {
     if (mainAcked) {
       fallbackDomObserver.disconnect();
@@ -469,16 +516,7 @@
       const m = mutations[i];
       if (m.type !== "childList") continue;
       for (let j = 0; j < m.addedNodes.length; j++) {
-        const node = m.addedNodes[j];
-        if (!node || node.nodeType !== 1) continue;
-        if (node.tagName === "META" && /^refresh$/i.test((node.getAttribute("http-equiv") || "").trim())) {
-          node.remove();
-        } else if (node.tagName === "BASE") {
-          const t = (node.getAttribute("target") || "").trim();
-          if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
-            node.removeAttribute("target");
-          }
-        }
+        cleanFallbackNode(m.addedNodes[j]);
       }
     }
   });
@@ -683,7 +721,7 @@
 
     const isInjectedExternalAnchor = (anchor, sameClean) => {
       if (sameClean || !anchor) return false;
-      if (Date.now() - touchOriginTime >= 4000) return false;
+      if (Date.now() - touchOriginTime >= 2500) return false;
       if (touchOriginAnchor === anchor) {
         return touchOriginWasPseudo;
       }
@@ -715,6 +753,9 @@
 
     const isTargetExistingFrame = (targetName) => {
       if (!targetName) return false;
+      try {
+        if (window.frames && window.frames[targetName]) return true;
+      } catch {}
       const frames = document.querySelectorAll("iframe[name], frame[name], object[name]");
       for (let i = 0; i < frames.length; i++) {
         if (frames[i].getAttribute("name") === targetName) return true;
@@ -1236,12 +1277,8 @@
       const now = Date.now();
       const hasUnsavedTyping = now - lastFormTypingTime < 30000;
       const isUnauthorized = allowMode === "NONE" || now > allowedUntil;
-      const isAutoRedirectNoGesture =
-        now - pageLoadTime > 800 &&
-        now - lastGestureTime > 1500 &&
-        isUnauthorized;
-      if ((hasUnsavedTyping && isUnauthorized) || isAutoRedirectNoGesture) {
-        reportBlock();
+      const recentBlockedAttempt = now - lastAttempt < 2500 && isUnauthorized;
+      if ((hasUnsavedTyping && isUnauthorized) || recentBlockedAttempt) {
         e.preventDefault();
         e.returnValue = "";
       }
@@ -1344,6 +1381,7 @@
         lastGestureTime = Date.now();
         if (e.key === "Enter" || e.key === " ") {
           const wantsNewTab = e.ctrlKey || e.metaKey || e.shiftKey;
+          captureTouchOrigin(e);
           trustedGestureDepth += 1;
           try {
             runVerifiedPress(e, wantsNewTab);
@@ -1625,36 +1663,45 @@
       } catch {}
 
       try {
-        const locProto = w.Location && w.Location.prototype;
-        if (locProto) {
-          const origAssign = locProto.assign;
-          const lockedAssign = maskAsNative(function (url) {
-            if (!bypassed && !isAllowed(String(url), false, w)) {
-              reportBlock();
-              return;
+        const patchLocTarget = (targetObj) => {
+          if (!targetObj) return;
+          if (typeof targetObj.assign === "function" && !targetObj.__gxAssignLocked) {
+            const origAssign = targetObj.assign;
+            const lockedAssign = maskAsNative(function (url) {
+              if (!bypassed && !isAllowed(String(url), false, w)) {
+                lastAttempt = Date.now();
+                reportBlock();
+                return;
+              }
+              return origAssign.apply(this, arguments);
+            }, "assign");
+            try {
+              Object.defineProperty(targetObj, "assign", { configurable: false, writable: false, value: lockedAssign });
+            } catch {
+              try { targetObj.assign = lockedAssign; } catch {}
             }
-            return origAssign.apply(this, arguments);
-          }, "assign");
-          try {
-            Object.defineProperty(locProto, "assign", { configurable: false, writable: false, value: lockedAssign });
-          } catch {
-            locProto.assign = lockedAssign;
+            try { Object.defineProperty(targetObj, "__gxAssignLocked", { value: true }); } catch {}
           }
-
-          const origReplace = locProto.replace;
-          const lockedReplace = maskAsNative(function (url) {
-            if (!bypassed && !isAllowed(String(url), false, w)) {
-              reportBlock();
-              return;
+          if (typeof targetObj.replace === "function" && !targetObj.__gxReplaceLocked) {
+            const origReplace = targetObj.replace;
+            const lockedReplace = maskAsNative(function (url) {
+              if (!bypassed && !isAllowed(String(url), false, w)) {
+                lastAttempt = Date.now();
+                reportBlock();
+                return;
+              }
+              return origReplace.apply(this, arguments);
+            }, "replace");
+            try {
+              Object.defineProperty(targetObj, "replace", { configurable: false, writable: false, value: lockedReplace });
+            } catch {
+              try { targetObj.replace = lockedReplace; } catch {}
             }
-            return origReplace.apply(this, arguments);
-          }, "replace");
-          try {
-            Object.defineProperty(locProto, "replace", { configurable: false, writable: false, value: lockedReplace });
-          } catch {
-            locProto.replace = lockedReplace;
+            try { Object.defineProperty(targetObj, "__gxReplaceLocked", { value: true }); } catch {}
           }
-        }
+        };
+        patchLocTarget(w.Location && w.Location.prototype);
+        patchLocTarget(w.location);
       } catch {}
 
       try {
@@ -1687,6 +1734,18 @@
                 lastAttempt = Date.now();
                 reportBlock();
                 return;
+              }
+            } else if (el.localName === "button" || el.localName === "input") {
+              const form = el.form || (el.closest && el.closest("form"));
+              const btnType = (el.getAttribute("type") || (el.localName === "button" ? "submit" : "")).toLowerCase();
+              if (form && (btnType === "submit" || btnType === "image")) {
+                const actionUrl = el.getAttribute("formaction") || form.getAttribute("action") || window.location.href;
+                const safeDest = (isSameSite(actionUrl) && !isRedirectGateway(actionUrl)) || isWhitelistedUrl(actionUrl);
+                if (!safeDest && !isAllowed(actionUrl, opensNew(el) || opensNew(form), w)) {
+                  lastAttempt = Date.now();
+                  reportBlock();
+                  return;
+                }
               }
             }
           }
@@ -1807,6 +1866,28 @@
 
     patchWindowEnvironment(window);
 
+    function sweepWindowFrames() {
+      try {
+        for (let i = 0; i < window.frames.length; i++) {
+          try { patchWindowEnvironment(window.frames[i]); } catch {}
+        }
+      } catch {}
+    }
+
+    function sanitizeSandboxAttr(el) {
+      if (!el || !el.hasAttribute || !el.hasAttribute("sandbox")) return;
+      const rawSrc = sanitizeRawUrl(el.getAttribute("src") || "");
+      if (rawSrc && (isSameSite(rawSrc) || isWhitelistedUrl(rawSrc))) return;
+      const sb = el.getAttribute("sandbox") || "";
+      if (/\ballow-(?:top-navigation(?:-by-user-activation)?|popups-to-escape-sandbox)\b/i.test(sb)) {
+        const cleaned = sb
+          .replace(/\ballow-(?:top-navigation(?:-by-user-activation)?|popups-to-escape-sandbox)\b/gi, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        try { el.setAttribute("sandbox", cleaned); } catch {}
+      }
+    }
+
     function patchFrameTree(node) {
       if (!node) return;
       if (node.nodeType === 11 && node.childNodes) {
@@ -1817,10 +1898,12 @@
       }
       if (node.nodeType !== 1) return;
       if (node.tagName === "IFRAME" || node.tagName === "FRAME" || node.tagName === "OBJECT") {
+        if (node.tagName === "IFRAME") sanitizeSandboxAttr(node);
         try { if (node.contentWindow) patchWindowEnvironment(node.contentWindow); } catch {}
       }
       if (node.querySelectorAll) {
         node.querySelectorAll("iframe, frame, object").forEach((f) => {
+          if (f.tagName === "IFRAME") sanitizeSandboxAttr(f);
           try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
         });
       }
@@ -1828,10 +1911,14 @@
 
     const isDangerousIframeSrc = (rawUrl) => {
       if (bypassed || hasActiveUserGesture()) return false;
-      const clean = sanitizeRawUrl(rawUrl).toLowerCase();
-      if (clean.startsWith("javascript:")) return true;
-      if (clean.startsWith("data:text/html") || clean.startsWith("data:application/xhtml")) {
-        return /<script|location|window\.open|http-equiv/i.test(clean);
+      const cleanOrig = sanitizeRawUrl(rawUrl);
+      const lower = cleanOrig.toLowerCase();
+      if (lower.startsWith("javascript:")) return true;
+      if (isExternalAppScheme(cleanOrig)) return true;
+      if (lower.startsWith("blob:") && blockedBlobUrls.has(cleanOrig)) return true;
+      if (lower.startsWith("data:text/html") || lower.startsWith("data:application/xhtml")) {
+        if (lower.includes(";base64,")) return true;
+        return /<script|location|window\.open|http-equiv/i.test(lower);
       }
       return false;
     };
@@ -1858,6 +1945,7 @@
               return;
             }
             srcDesc.set.call(this, val);
+            sanitizeSandboxAttr(this);
             try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
           }
         });
@@ -1872,6 +1960,7 @@
           get: sdDesc.get,
           set: function (html) {
             sdDesc.set.call(this, injectBootIntoSrcdoc(html));
+            sanitizeSandboxAttr(this);
             try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
           }
         });
@@ -1885,12 +1974,18 @@
         if (!bypassed && this && this.tagName === "IFRAME") {
           if (attrName === "srcdoc") {
             const res = origSetAttr.call(this, name, injectBootIntoSrcdoc(String(value)));
+            sanitizeSandboxAttr(this);
             try { if (this.contentWindow) patchWindowEnvironment(this.contentWindow); } catch {}
             return res;
           }
           if (attrName === "src" && isDangerousIframeSrc(value)) {
             reportBlock();
             return;
+          }
+          if (attrName === "sandbox") {
+            const res = origSetAttr.apply(this, arguments);
+            sanitizeSandboxAttr(this);
+            return res;
           }
         }
         const res = origSetAttr.apply(this, arguments);
@@ -1906,6 +2001,7 @@
       (e) => {
         const t = e.target;
         if (t && (t.tagName === "IFRAME" || t.tagName === "FRAME" || t.tagName === "OBJECT")) {
+          if (t.tagName === "IFRAME") sanitizeSandboxAttr(t);
           try { if (t.contentWindow) patchWindowEnvironment(t.contentWindow); } catch {}
         }
       },
@@ -2081,23 +2177,28 @@
     } catch {}
 
     const sanitizeWrittenHtml = (args) => {
-      if (bypassed) return args;
+      if (bypassed) return { out: args, hasFrames: false };
+      let hasFrames = false;
       const out = Array.from(args);
       for (let i = 0; i < out.length; i++) {
         if (typeof out[i] === "string") {
+          if (/<(?:i?frame|object)\b/i.test(out[i])) hasFrames = true;
           out[i] = out[i]
             .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?\s*refresh\s*["']?[^>]*>/gi, "")
             .replace(/<base\b([^>]*?)\btarget\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)([^>]*)>/gi, "<base$1$2>");
         }
       }
-      return out;
+      return { out, hasFrames };
     };
 
     try {
       const origWrite = Document.prototype.write;
       Document.prototype.write = maskAsNative(function () {
         if (!bypassed && this === document && this.readyState === "complete") return;
-        return origWrite.apply(this, sanitizeWrittenHtml(arguments));
+        const { out, hasFrames } = sanitizeWrittenHtml(arguments);
+        const res = origWrite.apply(this, out);
+        if (hasFrames) sweepWindowFrames();
+        return res;
       }, "write");
     } catch {}
 
@@ -2106,7 +2207,10 @@
       if (typeof origWriteln === "function") {
         Document.prototype.writeln = maskAsNative(function () {
           if (!bypassed && this === document && this.readyState === "complete") return;
-          return origWriteln.apply(this, sanitizeWrittenHtml(arguments));
+          const { out, hasFrames } = sanitizeWrittenHtml(arguments);
+          const res = origWriteln.apply(this, out);
+          if (hasFrames) sweepWindowFrames();
+          return res;
         }, "writeln");
       }
     } catch {}
@@ -2127,36 +2231,38 @@
       }
     };
 
-    const sanitizeNode = (node) => {
+    const sanitizeSingleElement = (node) => {
       if (!node || node.nodeType !== 1) return;
       const tag = node.tagName;
       if (tag === "META" && /^refresh$/i.test((node.getAttribute("http-equiv") || "").trim())) {
         node.remove();
-        return;
-      }
-      if (tag === "BASE") {
+      } else if (tag === "BASE") {
         sanitizeBaseTag(node);
-        return;
-      }
-      if (tag === "IFRAME" || tag === "FRAME" || tag === "OBJECT") {
+      } else if (tag === "IFRAME" || tag === "FRAME" || tag === "OBJECT") {
+        if (tag === "IFRAME") sanitizeSandboxAttr(node);
         try { if (node.contentWindow) patchWindowEnvironment(node.contentWindow); } catch {}
-        return;
       }
+    };
+
+    const sanitizeTree = (node) => {
+      if (!node || node.nodeType !== 1) return;
+      sanitizeSingleElement(node);
       if (node.firstElementChild) {
         node.querySelectorAll("meta[http-equiv]").forEach((m) => {
           if (/^refresh$/i.test((m.getAttribute("http-equiv") || "").trim())) m.remove();
         });
         node.querySelectorAll("base").forEach(sanitizeBaseTag);
         node.querySelectorAll("iframe, frame, object").forEach((f) => {
+          if (f.tagName === "IFRAME") sanitizeSandboxAttr(f);
           try { if (f.contentWindow) patchWindowEnvironment(f.contentWindow); } catch {}
         });
       }
     };
 
-    // Quét dọn ngay các phần tử chuyển hướng có sẵn ở đầu luồng HTML
     const sweepExistingNodes = () => {
       if (!bypassed && document.documentElement) {
-        sanitizeNode(document.documentElement);
+        sanitizeTree(document.documentElement);
+        sweepWindowFrames();
       }
     };
     sweepExistingNodes();
@@ -2166,7 +2272,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["http-equiv", "target", "href", "src", "srcdoc", "data"]
+      attributeFilter: ["http-equiv", "target", "href", "src", "srcdoc", "data", "sandbox"]
     };
 
     const obs = new MutationObserver((mutations) => {
@@ -2175,10 +2281,10 @@
         const m = mutations[i];
         if (m.type === "childList") {
           for (let j = 0; j < m.addedNodes.length; j++) {
-            sanitizeNode(m.addedNodes[j]);
+            sanitizeTree(m.addedNodes[j]);
           }
         } else if (m.type === "attributes") {
-          sanitizeNode(m.target);
+          sanitizeSingleElement(m.target);
         }
       }
     });
@@ -2199,18 +2305,20 @@
   }
 
   let injectAttempts = 0;
+  let lastAttemptedNonce = undefined;
   function injectMainWorld() {
     if (mainAcked || injectAttempts >= 6) return;
     try {
       const targetParent = document.head || document.documentElement;
       if (!targetParent) return;
-      injectAttempts += 1;
-      const scriptEl = document.createElement("script");
       const nonceEl = document.querySelector("script[nonce]");
-      if (nonceEl) {
-        const n = nonceEl.nonce || nonceEl.getAttribute("nonce");
-        if (n) scriptEl.setAttribute("nonce", n);
-      }
+      const currentNonce = nonceEl ? (nonceEl.nonce || nonceEl.getAttribute("nonce") || "") : "";
+      if (lastAttemptedNonce === currentNonce) return;
+      lastAttemptedNonce = currentNonce;
+      injectAttempts += 1;
+
+      const scriptEl = document.createElement("script");
+      if (currentNonce) scriptEl.setAttribute("nonce", currentNonce);
       let code = `(${mainWorldBlocker.toString()})(${JSON.stringify(TOKEN)}, ${JSON.stringify(checkBypassed())}, ${JSON.stringify(curRoot)}, ${JSON.stringify(curHost)}, ${JSON.stringify(whitelist)});`;
       if (window.trustedTypes) {
         try {
