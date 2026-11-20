@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GX Smart Anti-Redirect
 // @namespace    gx-smart-anti-redirect-ios
-// @version      6.0.0
-// @description  Chặn chuyển hướng toàn diện, chống bẫy chạm động, vượt CSP và tự đóng tab rác trên Orion iOS
+// @version      7.1.0
+// @description  Chặn chuyển hướng toàn diện, chống bẫy trong suốt, khóa tráo link động và ngắt vòng lặp redirect trên Orion iOS
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -83,7 +83,59 @@
     setVal("gx_blocked_count", blockedCount);
   };
 
-  // 1. Lớp bảo vệ tầng điều hướng (xử lý cả tab mới noopener & chuyển hướng cùng tab location.href)
+  function showLoopGuardBanner(targetDomain, prevUrl) {
+    const render = () => {
+      if (!document.body || document.getElementById("__gx_loop_bar")) return;
+      const bar = document.createElement("div");
+      bar.id = "__gx_loop_bar";
+      bar.style.cssText =
+        "position:fixed;left:12px;right:12px;bottom:16px;z-index:2147483647;" +
+        "background:#18181b;color:#f4f4f5;border:1px solid #3f3f46;border-radius:12px;" +
+        "padding:12px 14px;font:14px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;" +
+        "box-shadow:0 10px 25px rgba(0,0,0,0.45);display:flex;flex-direction:column;gap:10px;";
+
+      const msg = document.createElement("div");
+      msg.textContent = `GX Anti-Redirect đã ngắt chuyển hướng ép buộc tới ${targetDomain}`;
+
+      const actions = document.createElement("div");
+      actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+
+      const allowBtn = document.createElement("button");
+      allowBtn.textContent = "Mở trang này";
+      allowBtn.style.cssText =
+        "background:#27272a;color:#e4e4e7;border:1px solid #52525b;border-radius:8px;padding:6px 12px;font-size:13px;";
+      allowBtn.onclick = () => {
+        setVal("gx_legit_nav", { host: curHost, root: curRoot, time: Date.now() });
+        window.location.reload();
+      };
+
+      const backBtn = document.createElement("button");
+      backBtn.textContent = "Về trang trước";
+      backBtn.style.cssText =
+        "background:#2563eb;color:#fff;border:none;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;";
+      backBtn.onclick = () => {
+        if (prevUrl) {
+          window.location.replace(prevUrl);
+        } else {
+          window.history.go(-2);
+        }
+      };
+
+      actions.appendChild(allowBtn);
+      actions.appendChild(backBtn);
+      bar.appendChild(msg);
+      bar.appendChild(actions);
+      document.body.appendChild(bar);
+    };
+
+    if (document.body) {
+      render();
+    } else {
+      window.addEventListener("DOMContentLoaded", render, { once: true });
+    }
+  }
+
+  // Lớp bảo vệ tầng điều hướng & chống vòng lặp chuyển hướng ép buộc
   if (window.top === window.self && enabled && !checkBypassed()) {
     try {
       let refHost = "";
@@ -113,24 +165,37 @@
       const isUserIntendedNav =
         legitNav &&
         Date.now() - legitNav.time < 12000 &&
-        (legitNav.anyExternal || legitNav.root === curRoot || legitNav.host === curHost);
+        (legitNav.root === curRoot || legitNav.host === curHost);
 
       if ((fromExternalSite || spawnedByOpener || spawnedRightAfterTouch) && !isUserIntendedNav) {
         addBlock();
         try { window.stop(); } catch {}
+
         if (window.history.length <= 2 || spawnedByOpener) {
           try {
             if (document.documentElement) document.documentElement.innerHTML = "";
           } catch {}
           try { window.close(); } catch {}
         } else {
-          try { window.history.back(); } catch {}
+          const sourceRoot = refRoot || (lastTouch && lastTouch.root) || "";
+          const bounce = getVal("gx_bounce_guard", null);
+          const isRepeatedLoop =
+            bounce &&
+            bounce.from === sourceRoot &&
+            bounce.to === curRoot &&
+            Date.now() - bounce.time < 6000;
+
+          if (isRepeatedLoop) {
+            showLoopGuardBanner(curRoot || curHost, document.referrer);
+          } else {
+            setVal("gx_bounce_guard", { from: sourceRoot, to: curRoot, time: Date.now() });
+            try { window.history.back(); } catch {}
+          }
         }
       }
     } catch {}
   }
 
-  // Ghi nhận dấu chạm ở Content Script để nhận diện popunder rel="noopener" từ iframe
   const recordTouchActivity = () => {
     if (!checkBypassed() && curRoot) {
       setVal("gx_last_touch", { host: curHost, root: curRoot, time: Date.now() });
@@ -187,7 +252,6 @@
         setVal("gx_legit_nav", {
           host: e.data.host || "",
           root: e.data.root || "",
-          anyExternal: Boolean(e.data.anyExternal),
           time: Date.now()
         });
       }
@@ -195,7 +259,7 @@
     true
   );
 
-  // Lớp chặn dự phòng ở Content Script nếu trang web dùng CSP chặn hoàn toàn inline <script>
+  // Lớp chặn dự phòng ở Content Script khi trang khóa hoàn toàn inline <script>
   document.addEventListener(
     "click",
     (e) => {
@@ -220,7 +284,9 @@
               addBlock();
               return;
             }
-            setVal("gx_legit_nav", { host: h, root: r, anyExternal: same, time: Date.now() });
+            if (!same) {
+              setVal("gx_legit_nav", { host: h, root: r, time: Date.now() });
+            }
           } catch {}
           return;
         }
@@ -229,7 +295,7 @@
     true
   );
 
-  function mainWorldBlocker(token, initialBypassed, rootDomain, hostName) {
+  function mainWorldBlocker(token, initialBypassed, rootDomain, hostName, wlList) {
     if (window.__gxMainReady) return;
     window.__gxMainReady = true;
 
@@ -260,17 +326,27 @@
         : p.slice(-2).join(".");
     };
 
-    const reportLegitNav = (targetUrl, anyExternal = false) => {
+    const isWhitelistedUrl = (u) => {
       try {
-        const u = new URL(targetUrl || window.location.href, window.location.href);
+        const p = new URL(u, window.location.href);
+        const h = p.hostname.toLowerCase().replace(/^www\./, "");
+        const r = getInnerRoot(h);
+        return wlList.some((d) => h === d || h.endsWith("." + d) || r === d);
+      } catch {
+        return false;
+      }
+    };
+
+    const reportLegitExternalNav = (targetUrl) => {
+      try {
+        const u = new URL(targetUrl, window.location.href);
         const h = u.hostname.toLowerCase().replace(/^www\./, "");
         nativePost(
           {
             __gxToken: token,
             type: "GX_LEGIT_NAV",
             host: h,
-            root: getInnerRoot(h),
-            anyExternal
+            root: getInnerRoot(h)
           },
           "*"
         );
@@ -363,16 +439,23 @@
       if (!r.width || !r.height || (r.width >= window.innerWidth * 0.65 && r.height >= window.innerHeight * 0.65)) {
         return false;
       }
-      return a.innerText.trim().length > 0 || a.querySelector("img, svg, i, span, picture, canvas") !== null;
+      const s = window.getComputedStyle(a);
+      const hasBgImage = s.backgroundImage && s.backgroundImage !== "none" && r.width >= 16 && r.height >= 16;
+      return (
+        a.innerText.trim().length > 0 ||
+        a.querySelector("img, svg, i, span, picture, canvas") !== null ||
+        hasBgImage
+      );
     };
 
-    // Chỉ vô hiệu hóa lớp phủ tàng hình đè toàn màn hình, tránh đụng nhầm player video & modal hợp lệ
     function neutralizeInvisibleTrap(target) {
       if (!target || target.nodeType !== 1) return false;
       if (
         target === document.body ||
         target === document.documentElement ||
-        target.matches("video, audio, input, textarea, select, option, button, [role='button']")
+        target.matches(
+          "video, audio, iframe, frame, canvas, object, embed, input, textarea, select, option, button, [role='button']"
+        )
       ) {
         return false;
       }
@@ -381,12 +464,24 @@
       }
 
       const s = window.getComputedStyle(target);
-      const opacity = parseFloat(s.opacity);
-      const r = target.getBoundingClientRect();
-      const coversScreen = r.width >= window.innerWidth * 0.7 && r.height >= window.innerHeight * 0.6;
-      const isEmptyTrap = target.innerText.trim().length === 0 && !target.querySelector("img, video, canvas, input");
+      if (s.position !== "fixed" && s.position !== "absolute") return false;
 
-      if (opacity < 0.08 && (s.position === "fixed" || s.position === "absolute") && coversScreen && isEmptyTrap) {
+      const r = target.getBoundingClientRect();
+      const coversScreen = r.width >= window.innerWidth * 0.65 && r.height >= window.innerHeight * 0.55;
+      if (!coversScreen) return false;
+
+      const isEmptyTrap =
+        target.innerText.trim().length === 0 &&
+        !target.querySelector("img, video, canvas, iframe, input, svg");
+      if (!isEmptyTrap) return false;
+
+      const opacity = parseFloat(s.opacity);
+      const isTransparentBg =
+        (s.backgroundColor === "rgba(0, 0, 0, 0)" || s.backgroundColor === "transparent") &&
+        s.backgroundImage === "none" &&
+        parseFloat(s.borderTopWidth) === 0;
+
+      if (opacity < 0.08 || isTransparentBg) {
         try {
           target.style.setProperty("pointer-events", "none", "important");
         } catch {}
@@ -398,13 +493,33 @@
 
     window.addEventListener("input", (e) => { if (e.isTrusted) lastInput = Date.now(); }, true);
     window.addEventListener("change", (e) => { if (e.isTrusted) lastInput = Date.now(); }, true);
-    window.addEventListener("submit", (e) => {
-      if (e.isTrusted) {
-        allowMode = "BUTTON";
-        allowedUntil = Date.now() + 5000;
-        reportLegitNav(window.location.href, true);
-      }
-    }, true);
+
+    document.addEventListener(
+      "submit",
+      (e) => {
+        if (bypassed) return;
+        const form = e.target;
+        if (!form || form.tagName !== "FORM") return;
+        const actionUrl = form.getAttribute("action") || window.location.href;
+        const safeDest = isSameSite(actionUrl) || isWhitelistedUrl(actionUrl);
+
+        if (!e.isTrusted && !safeDest && !isAllowed(actionUrl, opensNew(form))) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          reportBlock();
+          return;
+        }
+        if (e.isTrusted) {
+          allowMode = "FORM_SUBMIT";
+          allowedUrl = actionUrl;
+          allowedUntil = Date.now() + 5000;
+          if (!isSameSite(actionUrl)) {
+            reportLegitExternalNav(actionUrl);
+          }
+        }
+      },
+      true
+    );
 
     function findControls(e) {
       const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
@@ -456,13 +571,12 @@
           allowedUntil = Date.now() + dur;
           if (wantsNewTab) {
             allowMode = "NEW_TAB";
-            reportLegitNav(lockedHref, same);
+            if (!same) reportLegitExternalNav(lockedHref);
           } else if (same) {
             allowMode = "DOMAIN";
-            reportLegitNav(lockedHref, true);
           } else {
             allowMode = "EXT_LINK";
-            reportLegitNav(lockedHref, false);
+            reportLegitExternalNav(lockedHref);
           }
           return true;
         }
@@ -477,8 +591,7 @@
         ) {
           allowMode = "BUTTON";
           allowedUrl = null;
-          allowedUntil = Date.now() + (nativeBtn ? 3500 : 2000);
-          reportLegitNav(window.location.href, true);
+          allowedUntil = Date.now() + (nativeBtn ? 3000 : 1800);
           return true;
         }
       }
@@ -507,7 +620,8 @@
       if (isNewTab) {
         if (expired) return false;
         if (allowMode === "NEW_TAB") return true;
-        if (allowMode === "EXT_LINK") return matchesAllowedHost(url);
+        if (allowMode === "EXT_LINK") return matchesAllowedHost(url) || isWhitelistedUrl(url);
+        if (allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") return isWhitelistedUrl(url);
         return false;
       }
 
@@ -515,8 +629,11 @@
       if (!selfClone && isSameSite(url)) return true;
 
       if (!expired) {
-        if (allowMode === "BUTTON" || allowMode === "NEW_TAB") return true;
+        if (allowMode === "NEW_TAB") return true;
         if ((allowMode === "DOMAIN" || allowMode === "EXT_LINK") && matchesAllowedHost(url)) return true;
+        if ((allowMode === "BUTTON" || allowMode === "FORM_SUBMIT") && (isSameSite(url) || isWhitelistedUrl(url))) {
+          return true;
+        }
       }
       return false;
     }
@@ -543,7 +660,6 @@
       );
     }
 
-    // Ghi nhận điểm chạm gốc để phát hiện bẫy tiêm thẻ <a> động giữa touchstart và click
     const onInitialPress = (e, wantsNewTab) => {
       if (!e.isTrusted || bypassed) return;
       if (neutralizeInvisibleTrap(e.target)) {
@@ -621,12 +737,17 @@
           return;
         }
 
-        const href = getAnchorHref(anchor);
+        // Khôi phục ngay href gốc nếu trang web tráo đích đến sau khi chạm tay
+        let href = getAnchorHref(anchor);
+        if (lockedA === anchor && lockedHref && href !== lockedHref) {
+          try { anchor.setAttribute("href", lockedHref); } catch {}
+          href = lockedHref;
+        }
+
         const same = isSameSite(href);
         const selfClone = normUrl(href) === normUrl(window.location.href);
         const newTab = opensNew(anchor);
 
-        // Chặn thẻ <a> ngoại lai mới được trang web tiêm lén sau khi ngón tay đã chạm màn hình
         const wasInjectedMidTap =
           !same &&
           Date.now() - touchOriginTime < 1200 &&
@@ -649,13 +770,9 @@
         }
 
         if (same) {
-          if (lockedA === anchor && lockedHref && href !== lockedHref) {
-            try { anchor.setAttribute("href", lockedHref); } catch {}
-          }
           if (newTab && allowMode !== "NEW_TAB") {
             try { anchor.setAttribute("target", "_self"); } catch {}
           }
-          reportLegitNav(href, true);
           return;
         }
 
@@ -666,10 +783,7 @@
           return;
         }
 
-        if (lockedA === anchor && lockedHref && href !== lockedHref) {
-          try { anchor.setAttribute("href", lockedHref); } catch {}
-        }
-        reportLegitNav(href, false);
+        reportLegitExternalNav(href);
       },
       true
     );
@@ -678,8 +792,9 @@
       if (!w || w.__gxOpenLocked) return;
       try {
         const orig = w.open;
-        const fn = function (url) {
-          return isAllowed(url, true) ? orig.apply(this, arguments) : fakeWin(url);
+        const fn = function (url, target) {
+          const isNew = !target || (target !== "_self" && target !== "_parent" && target !== "_top");
+          return isAllowed(url, isNew) ? orig.apply(this, arguments) : fakeWin(url);
         };
         try {
           Object.defineProperty(w, "open", { configurable: false, writable: false, value: fn });
@@ -740,6 +855,20 @@
     } catch {}
 
     try {
+      const cdDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "contentDocument");
+      if (cdDesc && cdDesc.get) {
+        Object.defineProperty(HTMLIFrameElement.prototype, "contentDocument", {
+          configurable: true,
+          get: function () {
+            const cd = cdDesc.get.call(this);
+            try { if (cd && cd.defaultView) lockOpen(cd.defaultView); } catch {}
+            return cd;
+          }
+        });
+      }
+    } catch {}
+
+    try {
       const origAssign = Location.prototype.assign;
       Location.prototype.assign = function (url) {
         if (!bypassed && !isAllowed(String(url), false)) {
@@ -767,7 +896,11 @@
         configurable: true,
         writable: true,
         value: function () {
-          const dl = this.hasAttribute("download") && allowMode === "BUTTON" && Date.now() <= allowedUntil;
+          const dl =
+            this.hasAttribute("download") &&
+            allowMode !== "NONE" &&
+            Date.now() <= allowedUntil &&
+            (isSameSite(this.href) || matchesAllowedHost(this.href));
           if (!bypassed && !dl && !isAllowed(this.href, opensNew(this))) {
             lastAttempt = Date.now();
             reportBlock();
@@ -778,20 +911,38 @@
       });
     } catch {}
 
+    const guardFormCall = (form, origFn, args) => {
+      const actionUrl = form.getAttribute("action") || window.location.href;
+      if (!bypassed && !isSameSite(actionUrl) && !isWhitelistedUrl(actionUrl) && !isAllowed(actionUrl, opensNew(form))) {
+        lastAttempt = Date.now();
+        reportBlock();
+        return;
+      }
+      return origFn.apply(form, args);
+    };
+
     try {
       const origFSubmit = HTMLFormElement.prototype.submit;
       Object.defineProperty(HTMLFormElement.prototype, "submit", {
         configurable: true,
         writable: true,
         value: function () {
-          if (!bypassed && opensNew(this) && !isAllowed(this.action, true)) {
-            lastAttempt = Date.now();
-            reportBlock();
-            return;
-          }
-          return origFSubmit.apply(this, arguments);
+          return guardFormCall(this, origFSubmit, arguments);
         }
       });
+    } catch {}
+
+    try {
+      const origFReqSubmit = HTMLFormElement.prototype.requestSubmit;
+      if (typeof origFReqSubmit === "function") {
+        Object.defineProperty(HTMLFormElement.prototype, "requestSubmit", {
+          configurable: true,
+          writable: true,
+          value: function () {
+            return guardFormCall(this, origFReqSubmit, arguments);
+          }
+        });
+      }
     } catch {}
 
     try {
@@ -805,40 +956,52 @@
     const obs = new MutationObserver(() => {
       if (bypassed) return;
       document.querySelectorAll('meta[http-equiv="refresh" i]').forEach((m) => m.remove());
+      document.querySelectorAll("base[target]").forEach((b) => {
+        const t = (b.getAttribute("target") || "").trim();
+        if (t && t !== "_self" && t !== "_parent" && t !== "_top") {
+          b.removeAttribute("target");
+        }
+      });
       for (let i = 0; i < window.frames.length; i++) lockOpen(window.frames[i]);
     });
-    if (document.documentElement) obs.observe(document.documentElement, { childList: true, subtree: true });
+    obs.observe(document, { childList: true, subtree: true });
   }
 
   function injectMainWorld() {
     if (mainAcked) return;
     try {
+      const targetParent = document.head || document.documentElement;
+      if (!targetParent) return;
       const scriptEl = document.createElement("script");
       const nonceEl = document.querySelector("script[nonce]");
       if (nonceEl) {
         const n = nonceEl.nonce || nonceEl.getAttribute("nonce");
         if (n) scriptEl.setAttribute("nonce", n);
       }
-      scriptEl.textContent = `(${mainWorldBlocker.toString()})(${JSON.stringify(TOKEN)}, ${JSON.stringify(checkBypassed())}, ${JSON.stringify(curRoot)}, ${JSON.stringify(curHost)});`;
-      (document.head || document.documentElement).appendChild(scriptEl);
+      let code = `(${mainWorldBlocker.toString()})(${JSON.stringify(TOKEN)}, ${JSON.stringify(checkBypassed())}, ${JSON.stringify(curRoot)}, ${JSON.stringify(curHost)}, ${JSON.stringify(whitelist)});`;
+      if (window.trustedTypes && window.trustedTypes.createPolicy) {
+        try {
+          const policy = window.trustedTypes.createPolicy("gx-anti-redirect-policy", {
+            createScript: (s) => s
+          });
+          code = policy.createScript(code);
+        } catch {}
+      }
+      scriptEl.textContent = code;
+      targetParent.appendChild(scriptEl);
       scriptEl.remove();
     } catch {}
   }
 
   injectMainWorld();
 
-  // Tự động tái tiêm nếu thẻ <script nonce> xuất hiện muộn sau 0ms trên trang dùng CSP chặt
   const cspObserver = new MutationObserver(() => {
     if (mainAcked) {
       cspObserver.disconnect();
       return;
     }
-    if (document.querySelector("script[nonce]")) {
-      injectMainWorld();
-      if (mainAcked) cspObserver.disconnect();
-    }
+    injectMainWorld();
+    if (mainAcked) cspObserver.disconnect();
   });
-  if (document.documentElement) {
-    cspObserver.observe(document.documentElement, { childList: true, subtree: true });
-  }
+  cspObserver.observe(document, { childList: true, subtree: true });
 })();
